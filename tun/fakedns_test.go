@@ -2,6 +2,7 @@ package tun
 
 import (
 	"fmt"
+	"net"
 	"testing"
 )
 
@@ -34,7 +35,7 @@ func TestFakeDNSAnswersA(t *testing.T) {
 	if resp[0] != 0x12 || resp[1] != 0x34 {
 		t.Fatal("response id does not match query id")
 	}
-	ip := net4(resp[len(resp)-4:])
+	ip := net.IP(resp[len(resp)-4:])
 	if d, found := f.Lookup(ip); !found || d != "example.com" {
 		t.Fatalf("lookup %s: got %q found=%v", ip, d, found)
 	}
