@@ -22,6 +22,10 @@ func truthy(s string) bool { s = strings.ToLower(s); return s == "1" || s == "tr
 
 // ParseLink converts a share link (vless://, vmess://, trojan://, ss://, ssh://)
 // into a Config and the display name.
+//
+// Features the library cannot honor are rejected with an error instead of
+// being dropped silently (which would only show up later as a connection that
+// never works): REALITY, VLESS flow (xtls-rprx-vision), Shadowsocks plugins.
 func ParseLink(link string) (*Config, string, error) {
 	link = strings.TrimSpace(link)
 	scheme, rest, ok := strings.Cut(link, "://")
@@ -83,6 +87,9 @@ func parseURLLink(scheme, link string) (*Config, string, error) {
 		return nil, "", err
 	}
 	port, _ := strconv.Atoi(u.Port())
+	if port == 0 && scheme == "ssh" {
+		port = 22
+	}
 	cfg := &Config{Protocol: scheme, Server: u.Hostname(), Port: port}
 	pw, _ := u.User.Password()
 	switch scheme {
@@ -95,6 +102,10 @@ func parseURLLink(scheme, link string) (*Config, string, error) {
 		cfg.Username, cfg.Password = u.User.Username(), pw
 	}
 	q := u.Query()
+	if scheme == "vless" && q.Get("flow") != "" {
+		// A server that expects a flow rejects clients that do not speak it.
+		return nil, "", fmt.Errorf("link: vless flow %q is not supported", q.Get("flow"))
+	}
 	if scheme == "trojan" && strings.EqualFold(q.Get("security"), "none") {
 		cfg.TLS.Enabled = false
 	}
@@ -155,7 +166,12 @@ func parseVMess(rest string) (*Config, string, error) {
 func parseSS(rest string) (*Config, string, error) {
 	rest, name, _ := strings.Cut(rest, "#")
 	name, _ = url.QueryUnescape(name)
-	rest, _, _ = strings.Cut(rest, "?") // plugins are not supported
+	rest, query, _ := strings.Cut(rest, "?")
+	if strings.Contains(query, "plugin=") {
+		// obfs-local / v2ray-plugin wrap the connection; ignoring them would
+		// produce a config that can never connect.
+		return nil, "", errors.New("link: shadowsocks plugins are not supported")
+	}
 	var userinfo, hostport string
 	if i := strings.LastIndex(rest, "@"); i >= 0 {
 		userinfo, hostport = rest[:i], rest[i+1:]
