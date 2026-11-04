@@ -5,10 +5,10 @@ package mobile
 
 import (
 	"context"
-	"strings"
 	"encoding/json"
 	"errors"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,7 +22,12 @@ import (
 type Protector interface{ Protect(fd int) bool }
 
 // SetProtector must be called before Start/StartTun/Probe while the VPN is up.
-func SetProtector(p Protector) { transport.SetProtector(p.Protect) }
+func SetProtector(p Protector) {
+	if p == nil {
+		return
+	}
+	transport.SetProtector(p.Protect)
+}
 
 var (
 	tunInst *tun.Tun
@@ -54,6 +59,9 @@ func StartTunEx(configJSON string, fd int, mtu int, dns string, fakeDNS, sniff b
 	if tunInst != nil {
 		return errors.New("v2tun: tun already running")
 	}
+	if cancel != nil { // the SOCKS server owns `active`
+		return errors.New("v2tun: socks server running; call Stop first")
+	}
 	c, err := newClient(configJSON)
 	if err != nil {
 		return err
@@ -67,19 +75,25 @@ func StartTunEx(configJSON string, fd int, mtu int, dns string, fakeDNS, sniff b
 	}
 	t, err := tun.Start(o)
 	if err != nil {
+		c.Close()
 		return err
 	}
 	tunInst, active = t, c
 	return nil
 }
 
-// StopTun tears the TUN stack down.
+// StopTun tears the TUN stack down and closes the tunnel's long-lived
+// connections (SSH session, mux, udpgw).
 func StopTun() {
 	mu.Lock()
 	defer mu.Unlock()
 	if tunInst != nil {
 		tunInst.Close()
-		tunInst, active = nil, nil
+		tunInst = nil
+		if active != nil {
+			active.Close()
+			active = nil
+		}
 	}
 }
 
@@ -102,6 +116,7 @@ func Probe(configJSON, target string) error {
 	if err != nil {
 		return err
 	}
+	defer c.Close() // a throwaway client must not leave an SSH session behind
 	ctx, cf := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cf()
 	conn, err := c.DialContext(ctx, "tcp", target)
@@ -118,12 +133,16 @@ func Start(configJSON, listenAddr string) error {
 	if cancel != nil {
 		return errors.New("v2tun: already running")
 	}
+	if tunInst != nil { // the TUN stack owns `active`
+		return errors.New("v2tun: tun running; call StopTun first")
+	}
 	c, err := newClient(configJSON)
 	if err != nil {
 		return err
 	}
 	l, err := net.Listen("tcp", listenAddr)
 	if err != nil {
+		c.Close()
 		return err
 	}
 	ctx, cf := context.WithCancel(context.Background())
@@ -133,14 +152,15 @@ func Start(configJSON, listenAddr string) error {
 	return nil
 }
 
-// Stop shuts the SOCKS5 server down.
+// Stop shuts the SOCKS5 server down and closes the tunnel's long-lived connections.
 func Stop() {
 	mu.Lock()
 	defer mu.Unlock()
 	if cancel != nil {
 		cancel()
 		cancel = nil
-		if tunInst == nil {
+		if active != nil {
+			active.Close()
 			active = nil
 		}
 	}
@@ -166,6 +186,7 @@ func Ping(configJSON, url string) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
+	defer c.Close()
 	d, err := c.Ping(context.Background(), url)
 	return d.Milliseconds(), err
 }
