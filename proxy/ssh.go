@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"net"
 	"sync"
 	"time"
@@ -61,35 +62,99 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 		raw.Close()
 		return nil, err
 	}
-	s.client = ssh.NewClient(cc, chans, reqs)
-	go func(cl *ssh.Client) { // keepalive so NAT/carriers don't drop the tunnel
+	cl := ssh.NewClient(cc, chans, reqs)
+	s.client = cl
+	go func() { // keepalive so NAT/carriers don't drop the tunnel
 		for {
 			time.Sleep(25 * time.Second)
 			if _, _, err := cl.SendRequest("keepalive@openssh.com", true, nil); err != nil {
 				return
 			}
 		}
-	}(s.client)
-	go func() { s.client.Wait(); s.mu.Lock(); s.client = nil; s.mu.Unlock() }()
-	return s.client, nil
+	}()
+	go func() {
+		cl.Wait()
+		s.drop(cl)
+	}()
+	return cl, nil
+}
+
+// drop forgets cl (if it is still the current session) and closes it.
+func (s *SSH) drop(cl *ssh.Client) {
+	s.mu.Lock()
+	if s.client == cl {
+		s.client = nil
+	}
+	s.mu.Unlock()
+	cl.Close()
+}
+
+// Close ends the SSH session and, with it, the keepalive. Without this the
+// session (and its TCP connection) outlives a stopped VPN.
+func (s *SSH) Close() error {
+	s.mu.Lock()
+	cl := s.client
+	s.client = nil
+	s.mu.Unlock()
+	if cl != nil {
+		return cl.Close()
+	}
+	return nil
+}
+
+// dialChannel opens a direct-tcpip channel but gives up when ctx ends
+// (ssh.Client.Dial itself has no timeout).
+func dialChannel(ctx context.Context, cl *ssh.Client, target string) (net.Conn, error) {
+	type result struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		conn, err := cl.Dial("tcp", target)
+		ch <- result{conn, err}
+	}()
+	select {
+	case r := <-ch:
+		return r.conn, r.err
+	case <-ctx.Done():
+		go func() {
+			if r := <-ch; r.conn != nil {
+				r.conn.Close()
+			}
+		}()
+		return nil, ctx.Err()
+	}
 }
 
 func (s *SSH) DialContext(ctx context.Context, network, target string) (net.Conn, error) {
-	c, err := s.connect(ctx)
-	if err != nil {
-		return nil, err
+	for attempt := 0; ; attempt++ {
+		cl, err := s.connect(ctx)
+		if err != nil {
+			return nil, err
+		}
+		conn, err := dialChannel(ctx, cl, target)
+		if err == nil {
+			return conn, nil
+		}
+		// The target refusing the connection says nothing about the session.
+		var refused *ssh.OpenChannelError
+		if errors.As(err, &refused) || attempt > 0 || ctx.Err() != nil {
+			return nil, err
+		}
+		// The session may have died since its last use: reconnect once.
+		s.drop(cl)
 	}
-	return c.Dial("tcp", target)
 }
 
 // SSHOptions are advanced and optional (not exposed by the UI). Empty lists
 // mean "maximum compatibility": modern algorithms first, legacy ones after,
 // so old provider servers still connect.
 type SSHOptions struct {
-	Ciphers       []string
-	KeyExchanges  []string
-	MACs          []string
-	HostKeyAlgos  []string
+	Ciphers      []string
+	KeyExchanges []string
+	MACs         []string
+	HostKeyAlgos []string
 }
 
 var (
