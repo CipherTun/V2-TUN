@@ -4,10 +4,11 @@ package v2tun
 import (
 	"context"
 	"errors"
-	"strconv"
 	"fmt"
+	"io"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -56,28 +57,28 @@ type Advanced struct {
 }
 
 type Config struct {
-	Protocol   string         `json:"protocol"` // trojan|vless|vmess|shadowsocks|ssh
-	Network    string         `json:"network"`  // tcp (default)|ws|httpupgrade|h2|grpc|quic
-	GRPCService string        `json:"grpcService"`
-	XHTTPMode   string        `json:"xhttpMode"` // auto|packet-up|stream-one
+	Protocol    string          `json:"protocol"` // trojan|vless|vmess|shadowsocks|ssh
+	Network     string          `json:"network"`  // tcp (default)|ws|httpupgrade|h2|grpc|quic|xhttp
+	GRPCService string          `json:"grpcService"`
+	XHTTPMode   string          `json:"xhttpMode"` // auto|packet-up|stream-one
 	Fragment    *FragmentConfig `json:"fragment,omitempty"`
-	Server     string         `json:"server"`
-	Port       int            `json:"port"`
-	UUID       string         `json:"uuid"`
-	AlterID    int            `json:"alterId"`
-	Password   string         `json:"password"`
-	Username   string         `json:"username"`
-	Method     string         `json:"method"`
-	PrivateKey string         `json:"privateKey"`
-	TLS        TLSConfig      `json:"tls"`
-	WS         WSConfig       `json:"ws"`
-	Payload    *PayloadConfig `json:"payload,omitempty"`
-	Advanced   Advanced       `json:"advanced"`
-	Routing    *route.Config  `json:"routing,omitempty"`
-	Mux        *MuxConfig     `json:"mux,omitempty"`
-	UDPGW      string         `json:"udpgw"`      // BadVPN udpgw address as seen from the server, e.g. "127.0.0.1:7300"
-	DirectDNS  string         `json:"directDns"`  // resolver for hostnames, bypasses the VPN (default 1.1.1.1:53)
-	TimeoutSec int            `json:"timeoutSec"`
+	Server      string          `json:"server"`
+	Port        int             `json:"port"`
+	UUID        string          `json:"uuid"`
+	AlterID     int             `json:"alterId"`
+	Password    string          `json:"password"`
+	Username    string          `json:"username"`
+	Method      string          `json:"method"`
+	PrivateKey  string          `json:"privateKey"`
+	TLS         TLSConfig       `json:"tls"`
+	WS          WSConfig        `json:"ws"`
+	Payload     *PayloadConfig  `json:"payload,omitempty"`
+	Advanced    Advanced        `json:"advanced"`
+	Routing     *route.Config   `json:"routing,omitempty"`
+	Mux         *MuxConfig      `json:"mux,omitempty"`
+	UDPGW       string          `json:"udpgw"`     // BadVPN udpgw address as seen from the server, e.g. "127.0.0.1:7300"
+	DirectDNS   string          `json:"directDns"` // resolver for hostnames, bypasses the VPN (default 1.1.1.1:53)
+	TimeoutSec  int             `json:"timeoutSec"`
 }
 
 type MuxConfig struct {
@@ -192,6 +193,19 @@ func New(cfg *Config) (*Client, error) {
 	return c, nil
 }
 
+// Close releases long-lived resources: the SSH session, shared Mux.Cool
+// connections and the udpgw stream. A Client that is just dropped keeps
+// them (and their keepalive goroutines) alive after the VPN stops.
+func (c *Client) Close() error {
+	if cl, ok := c.out.(io.Closer); ok {
+		cl.Close()
+	}
+	if c.gw != nil {
+		c.gw.Close()
+	}
+	return nil
+}
+
 // SetRouteList supplies a named list (domains or CIDRs) for "list:NAME" rules.
 func (c *Client) SetRouteList(name string, items []string) error {
 	if c.router == nil {
@@ -261,7 +275,13 @@ func (c *Client) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
 		if u, ok := c.out.(proxy.UDPOutbound); ok {
 			conn, err = u.DialUDP(ctx, addr)
 		} else if c.gw != nil {
-			conn, err = c.gw.DialUDP(ctx, addr)
+			// udpgw only takes IP targets, but the TUN layer hands over a
+			// domain when fake-IP DNS or sniffing recovered one: resolve it
+			// here (protected resolver) instead of failing every such flow.
+			var ipAddr string
+			if ipAddr, err = c.resolveAddr(ctx, addr); err == nil {
+				conn, err = c.gw.DialUDP(ctx, ipAddr)
+			}
 		} else {
 			return nil, proxy.ErrNotImplemented
 		}
@@ -270,6 +290,34 @@ func (c *Client) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
 		return nil, err
 	}
 	return countConn{conn}, nil
+}
+
+// resolveAddr turns host:port into ip:port using the protected resolver.
+// IP literals pass through; IPv4 answers are preferred.
+func (c *Client) resolveAddr(ctx context.Context, addr string) (string, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return "", err
+	}
+	if net.ParseIP(host) != nil {
+		return addr, nil
+	}
+	rs := c.resolver
+	if rs == nil {
+		rs = net.DefaultResolver
+	}
+	ips, err := rs.LookupIPAddr(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return "", fmt.Errorf("v2tun: resolve %s: %v", host, err)
+	}
+	pick := ips[0].IP
+	for _, a := range ips {
+		if a.IP.To4() != nil {
+			pick = a.IP
+			break
+		}
+	}
+	return net.JoinHostPort(pick.String(), port), nil
 }
 
 type udpConn struct {
@@ -309,7 +357,7 @@ func (c *Client) directUDP(ctx context.Context, addr string) (net.Conn, error) {
 // baseChain builds tcp -> [payload pre] -> tls -> [payload post] (or QUIC alone).
 func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *net.Resolver) (transport.Dialer, error) {
 	if net_ == "quic" { // QUIC carries its own TLS; payload and TLS layers don't apply
-		return &transport.QUIC{ServerName: cfg.TLS.SNI, ALPN: cfg.TLS.ALPN, AllowInsecure: cfg.TLS.AllowInsecure}, nil
+		return &transport.QUIC{ServerName: cfg.TLS.SNI, ALPN: cfg.TLS.ALPN, AllowInsecure: cfg.TLS.AllowInsecure, Resolver: res}, nil
 	}
 	var d transport.Dialer = &transport.TCP{Timeout: to, Resolver: res}
 	if f := cfg.Fragment; f != nil {
