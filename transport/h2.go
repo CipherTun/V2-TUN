@@ -19,12 +19,13 @@ import (
 
 // h2Stream is a net.Conn over one streaming HTTP/2 POST.
 type h2Stream struct {
-	raw   net.Conn
-	wr    *io.PipeWriter
-	ready chan struct{}
-	resp  *http.Response
-	err   error
-	once  sync.Once
+	raw    net.Conn
+	wr     *io.PipeWriter
+	ready  chan struct{}
+	resp   *http.Response
+	err    error
+	once   sync.Once
+	cancel context.CancelFunc
 }
 
 func (s *h2Stream) Read(p []byte) (int, error) {
@@ -37,6 +38,9 @@ func (s *h2Stream) Read(p []byte) (int, error) {
 func (s *h2Stream) Write(p []byte) (int, error) { return s.wr.Write(p) }
 func (s *h2Stream) Close() error {
 	s.once.Do(func() {
+		// Cancel first: if the server never answers, RoundTrip would otherwise
+		// block forever and the socket below would never be closed.
+		s.cancel()
 		s.wr.Close()
 		go func() {
 			<-s.ready
@@ -70,15 +74,18 @@ func openH2(ctx context.Context, raw net.Conn, tlsOn bool, host, path string, hd
 	if i := strings.IndexByte(path, '?'); i >= 0 {
 		u.Path, u.RawQuery = path[:i], path[i+1:]
 	}
-	req, err := http.NewRequestWithContext(context.WithoutCancel(ctx), "POST", u.String(), pr)
+	// The stream outlives the dial context but must be cancellable on Close.
+	rctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	req, err := http.NewRequestWithContext(rctx, "POST", u.String(), pr)
 	if err != nil {
+		cancel()
 		raw.Close()
 		return nil, err
 	}
 	for k, v := range hdr {
 		req.Header.Set(k, v)
 	}
-	s := &h2Stream{raw: raw, wr: pw, ready: make(chan struct{})}
+	s := &h2Stream{raw: raw, wr: pw, ready: make(chan struct{}), cancel: cancel}
 	go func() {
 		defer close(s.ready)
 		resp, err := cc.RoundTrip(req)
