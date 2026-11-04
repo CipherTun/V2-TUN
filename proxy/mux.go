@@ -22,6 +22,18 @@ type Mux struct {
 	conns []*muxConn
 }
 
+// Close drops every shared connection (and with it all open sessions).
+func (m *Mux) Close() error {
+	m.mu.Lock()
+	conns := m.conns
+	m.conns = nil
+	m.mu.Unlock()
+	for _, c := range conns {
+		c.raw.Close() // readLoop notices and finishes the streams
+	}
+	return nil
+}
+
 func (m *Mux) open(ctx context.Context, network byte, target string) (net.Conn, error) {
 	a, err := parseTarget(target)
 	if err != nil {
@@ -81,7 +93,17 @@ func (c *muxConn) count() int   { c.mu.Lock(); defer c.mu.Unlock(); return len(c
 func (c *muxConn) newStream(network byte, addr []byte) *muxStream {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.next++
+	// Session ids are 16 bit and a long-lived connection wraps around; never
+	// hand out an id that a live stream still uses.
+	for {
+		c.next++
+		if c.next == 0 {
+			continue
+		}
+		if _, used := c.streams[c.next]; !used {
+			break
+		}
+	}
 	s := &muxStream{c: c, id: c.next, network: network, addr: addr,
 		rq: make(chan []byte, 64), done: make(chan struct{})}
 	c.streams[s.id] = s

@@ -29,6 +29,17 @@ type Client struct {
 	wmu   sync.Mutex
 }
 
+// Close drops the udpgw stream; open flows end with EOF.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	conn := c.conn
+	c.mu.Unlock()
+	if conn != nil {
+		return conn.Close() // readLoop notices and fails the flows
+	}
+	return nil
+}
+
 func (c *Client) connect(ctx context.Context) error {
 	if c.conn != nil {
 		return nil
