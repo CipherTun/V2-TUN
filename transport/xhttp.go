@@ -81,15 +81,19 @@ func (d *XHTTP) DialContext(ctx context.Context, network, addr string) (net.Conn
 		raw.Close()
 		return nil, err
 	}
+	// The session outlives the dial context but must be cancellable on Close,
+	// otherwise a server that never answers the GET leaks the socket.
+	rctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 	c := &xhttpConn{raw: raw, cc: cc, host: host, base: path + sessionID(), hdr: d.Headers,
-		ready: make(chan struct{}), wch: make(chan []byte, 32), closed: make(chan struct{})}
+		ready: make(chan struct{}), wch: make(chan []byte, 32), closed: make(chan struct{}),
+		cancel: cancel}
 	if d.TLS {
 		c.scheme = "https"
 	} else {
 		c.scheme = "http"
 	}
-	go c.download(context.WithoutCancel(ctx))
-	go c.uploader(context.WithoutCancel(ctx))
+	go c.download(rctx)
+	go c.uploader(rctx)
 	return c, nil
 }
 
@@ -107,6 +111,7 @@ type xhttpConn struct {
 
 	wch    chan []byte
 	closed chan struct{}
+	cancel context.CancelFunc
 	once   sync.Once
 	mu     sync.Mutex
 	werr   error
@@ -209,6 +214,7 @@ func (c *xhttpConn) Write(p []byte) (int, error) {
 func (c *xhttpConn) Close() error {
 	c.once.Do(func() {
 		close(c.closed)
+		c.cancel()
 		go func() {
 			<-c.ready
 			if c.resp != nil {

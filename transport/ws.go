@@ -12,6 +12,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 )
 
@@ -33,6 +34,14 @@ func (d *WebSocket) DialContext(ctx context.Context, network, addr string) (net.
 	}
 	host := d.Host
 	if host == "" {
+		// A Host entry in Headers is honored when no explicit host is set.
+		for k, v := range d.Headers {
+			if strings.EqualFold(k, "host") && v != "" {
+				host = v
+			}
+		}
+	}
+	if host == "" {
 		host, _, _ = net.SplitHostPort(addr)
 	}
 	path := d.Path
@@ -42,13 +51,12 @@ func (d *WebSocket) DialContext(ctx context.Context, network, addr string) (net.
 	kb := make([]byte, 16)
 	rand.Read(kb)
 	key := base64.StdEncoding.EncodeToString(kb)
-	proto := "websocket"
-	if d.Upgrade {
-		proto = "websocket"
-	}
-	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: %s\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n",
-		path, host, proto, key)
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: %s\r\nSec-WebSocket-Version: 13\r\n",
+		path, host, key)
 	for k, v := range d.Headers {
+		if strings.EqualFold(k, "host") { // already sent above; a duplicate Host gets a 400 from many servers
+			continue
+		}
 		req += k + ": " + v + "\r\n"
 	}
 	req += "\r\n"
@@ -58,9 +66,13 @@ func (d *WebSocket) DialContext(ctx context.Context, network, addr string) (net.
 	}
 	br := bufio.NewReader(c)
 	resp, err := http.ReadResponse(br, nil)
-	if err != nil || resp.StatusCode != 101 {
+	if err != nil {
 		c.Close()
-		return nil, fmt.Errorf("websocket: upgrade failed (%v, %v)", resp, err)
+		return nil, fmt.Errorf("websocket: upgrade failed: %w", err)
+	}
+	if resp.StatusCode != 101 {
+		c.Close()
+		return nil, fmt.Errorf("websocket: upgrade failed: status %s", resp.Status)
 	}
 	if !d.Upgrade {
 		sum := sha1.Sum([]byte(key + wsGUID))
