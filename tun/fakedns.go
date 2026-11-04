@@ -38,7 +38,9 @@ func (f *FakeDNS) alloc(domain string) net.IP {
 		}
 		f.byDomain[domain], f.byIdx[idx] = idx, domain
 	}
-	return net.IPv4(198, 18, byte(idx>>8), byte(idx))
+	// 17 bits of index: bit 16 selects 198.18 vs 198.19. Dropping it would make
+	// address 65536+n collide with n.
+	return net.IPv4(198, 18+byte(idx>>16), byte(idx>>8), byte(idx))
 }
 
 // Lookup maps a fake address back to its domain.

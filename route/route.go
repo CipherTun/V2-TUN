@@ -3,6 +3,10 @@
 // (suffix, also the default for bare names), "keyword:x", "regexp:x".
 // IP rules: CIDR/IP or "geoip:private". "list:NAME" pulls entries supplied at
 // runtime with SetList (ship your own country lists; no GeoIP db is bundled).
+//
+// A rule that names domains or IPs but currently has no entries (for example
+// "list:NAME" before SetList was called) never matches. It does not fall
+// through to "match everything".
 package route
 
 import (
@@ -51,6 +55,8 @@ type matcher struct {
 	ips     []*net.IPNet
 	ports   []portRange
 	network string
+	hasDom  bool // the rule lists domains (possibly all still empty)
+	hasIP   bool // the rule lists IPs (possibly all still empty)
 }
 
 type Router struct {
@@ -103,15 +109,27 @@ func (r *Router) compile() error {
 	defer r.mu.Unlock()
 	var rules []matcher
 	for _, rule := range r.cfg.Rules {
-		m := matcher{action: rule.Action, network: strings.ToLower(rule.Network)}
+		m := matcher{action: rule.Action, network: strings.ToLower(rule.Network),
+			hasDom: len(rule.Domain) > 0, hasIP: len(rule.IP) > 0}
 		if m.action == "" {
 			m.action = Proxy
 		}
 		for _, e := range r.expand(rule.Domain) {
-			e = strings.ToLower(strings.TrimSpace(e))
+			e = strings.TrimSpace(e)
 			if e == "" || strings.HasPrefix(e, "#") {
 				continue
 			}
+			// Regular expressions keep their case (\D, \S, \W would change
+			// meaning if lowercased); hosts are lowercased, so match case-insensitively.
+			if expr, ok := strings.CutPrefix(e, "regexp:"); ok {
+				re, err := regexp.Compile("(?i)" + expr)
+				if err != nil {
+					return err
+				}
+				m.dom = append(m.dom, domMatch{kind: 3, re: re})
+				continue
+			}
+			e = strings.ToLower(e)
 			d := domMatch{s: e}
 			switch {
 			case strings.HasPrefix(e, "full:"):
@@ -120,12 +138,6 @@ func (r *Router) compile() error {
 				d.s = e[7:]
 			case strings.HasPrefix(e, "keyword:"):
 				d.kind, d.s = 2, e[8:]
-			case strings.HasPrefix(e, "regexp:"):
-				re, err := regexp.Compile(e[7:])
-				if err != nil {
-					return err
-				}
-				d.kind, d.re = 3, re
 			case strings.HasPrefix(e, "geosite:"):
 				return fmt.Errorf("route: %q needs a list; use list:NAME with SetList", e)
 			}
@@ -241,10 +253,10 @@ func (r *Router) Decide(ctx context.Context, network, host string, port int) Act
 		if !m.basic(network, port) {
 			continue
 		}
-		if len(m.dom) > 0 && (ip != nil || !m.domOK(host)) {
+		if m.hasDom && (len(m.dom) == 0 || ip != nil || !m.domOK(host)) {
 			continue
 		}
-		if len(m.ips) > 0 && (ip == nil || !m.ipOK(ip)) {
+		if m.hasIP && (len(m.ips) == 0 || ip == nil || !m.ipOK(ip)) {
 			continue
 		}
 		return m.action
@@ -253,7 +265,7 @@ func (r *Router) Decide(ctx context.Context, network, host string, port int) Act
 		if ips, err := r.Resolve(ctx, host); err == nil {
 			for i := range rules {
 				m := &rules[i]
-				if len(m.ips) == 0 || len(m.dom) > 0 || !m.basic(network, port) {
+				if !m.hasIP || len(m.ips) == 0 || m.hasDom || !m.basic(network, port) {
 					continue
 				}
 				for _, rip := range ips {
