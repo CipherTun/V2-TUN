@@ -4,7 +4,8 @@
 // TCP goes straight through the v2tun Dialer. UDP goes through UDPDialer when
 // set (native UDP relay or BadVPN udpgw). With Fake set, DNS A queries get
 // fake addresses so domain routing works; with Sniff, TLS SNI / HTTP Host
-// replace raw IPs for routing and for the proxy server.
+// replace raw IPs for routing and for the proxy server, and the sniffed
+// protocol is handed to the router (see route.WithProtocol).
 //
 // Pin gVisor with: go get gvisor.dev/gvisor@go   (its API moves; adjust
 // NewUDPConn/NewForwarder calls if your version differs).
@@ -29,6 +30,8 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
 	"gvisor.dev/gvisor/pkg/waiter"
+
+	"io.surprise.vpn/route"
 )
 
 type Dialer interface {
@@ -46,7 +49,7 @@ type Options struct {
 	Dialer Dialer
 	UDP    UDPDialer // optional: enables full UDP relay
 	Fake   *FakeDNS  // optional: fake-IP DNS
-	Sniff  bool      // sniff TLS SNI / HTTP Host from the first bytes
+	Sniff  bool      // sniff TLS SNI / HTTP Host / protocol from the first bytes
 }
 
 type Tun struct {
@@ -146,21 +149,23 @@ func relay(ctx context.Context, local net.Conn, dst string, o Options) {
 	dst = resolveDst(dst, o)
 	host, port, _ := net.SplitHostPort(dst)
 	var first []byte
+	proto := ""
 	if o.Sniff && net.ParseIP(host) != nil && port != "53" {
 		// Clients speak first for TLS/HTTP; servers-first protocols just time out.
-		local.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
-		buf := make([]byte, 4096)
-		n, err := local.Read(buf)
-		local.SetReadDeadline(time.Time{})
-		if n == 0 && err != nil && !isTimeout(err) {
+		b, err := readFirst(local, 300*time.Millisecond)
+		if len(b) == 0 && err != nil && !isTimeout(err) {
 			return
 		}
-		first = buf[:n]
+		first = b
 		if d := SniffDomain(first); d != "" {
 			dst = net.JoinHostPort(d, port)
 		}
+		proto = SniffProtocol(first)
 	}
 	dctx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	if proto != "" {
+		dctx = route.WithProtocol(dctx, proto)
+	}
 	up, err := o.Dialer.DialContext(dctx, "tcp", dst)
 	cancel()
 	if err != nil {
@@ -218,6 +223,10 @@ func dnsOverTCP(ctx context.Context, d Dialer, server string, q []byte) ([]byte,
 		return nil, err
 	}
 	defer c.Close()
+	// A stalled server must not pin this goroutine: SetDeadline is a no-op on
+	// some tunnel conns (mux streams), so close the conn when time is up.
+	stall := time.AfterFunc(8*time.Second, func() { c.Close() })
+	defer stall.Stop()
 	if _, err := c.Write(append(binary.BigEndian.AppendUint16(nil, uint16(len(q))), q...)); err != nil {
 		return nil, err
 	}
