@@ -10,10 +10,18 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with: {go-version: stable, cache: false}
-      - run: |
+      - name: Resolve dependencies (no -u: keep versions from go.mod)
+        run: |
           go get gvisor.dev/gvisor@go
-          go get -u ./...
           go mod tidy
+      - name: Keep the resolved go.mod / go.sum
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-mod-files
+          path: |
+            go.mod
+            go.sum
+          if-no-files-found: error
       - run: go build ./...
       - run: go vet ./...
       - run: go test -race -count=1 ./...
