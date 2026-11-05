@@ -86,17 +86,15 @@ func TestSplitAndDelay(t *testing.T) {
 		t.Fatal(err)
 	}
 	segs := tp.Render(Context{})
-	if len(segs) != 5 {
+	wantData := []string{"AB", "CD", "EF", "GH"}
+	wantDelay := []time.Duration{0, 250 * time.Millisecond, time.Second, 1500 * time.Millisecond}
+	if len(segs) != len(wantData) {
 		t.Fatalf("got %d segments: %+v", len(segs), segs)
 	}
-	want := []time.Duration{0, 250 * time.Millisecond, time.Second, 1500 * time.Millisecond, 0}
 	for i, s := range segs {
-		if s.Delay != want[i] {
-			t.Errorf("segment %d: delay %v, want %v", i, s.Delay, want[i])
+		if string(s.Data) != wantData[i] || s.Delay != wantDelay[i] {
+			t.Errorf("segment %d: %q +%v, want %q +%v", i, s.Data, s.Delay, wantData[i], wantDelay[i])
 		}
-	}
-	if string(segs[0].Data) != "AB" || string(segs[1].Data) != "CD" || string(segs[4].Data) != "" && len(segs) != 5 {
-		t.Errorf("unexpected data: %+v", segs)
 	}
 }
 
