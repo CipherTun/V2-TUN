@@ -25,7 +25,9 @@ func truthy(s string) bool { s = strings.ToLower(s); return s == "1" || s == "tr
 //
 // Features the library cannot honor are rejected with an error instead of
 // being dropped silently (which would only show up later as a connection that
-// never works): REALITY, VLESS flow (xtls-rprx-vision), Shadowsocks plugins.
+// never works): VLESS flow (xtls-rprx-vision) and Shadowsocks plugins.
+// REALITY links (security=reality with pbk, sid, sni, fp) are supported; the
+// spiderX crawl (spx) is ignored.
 func ParseLink(link string) (*Config, string, error) {
 	link = strings.TrimSpace(link)
 	scheme, rest, ok := strings.Cut(link, "://")
@@ -60,7 +62,15 @@ func applyQuery(cfg *Config, q url.Values) error {
 	case "tls":
 		cfg.TLS.Enabled = true
 	case "reality":
-		return errors.New("link: reality is not supported yet")
+		if q.Get("pbk") == "" {
+			return errors.New("link: reality link has no pbk (server public key)")
+		}
+		cfg.Reality = &RealityConfig{
+			PublicKey:   q.Get("pbk"),
+			ShortID:     q.Get("sid"),
+			ServerName:  q.Get("sni"),
+			Fingerprint: q.Get("fp"),
+		}
 	case "", "none":
 	default:
 		return fmt.Errorf("link: unknown security %q", sec)
