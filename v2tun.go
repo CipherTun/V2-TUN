@@ -48,6 +48,13 @@ type WSConfig struct {
 	Headers map[string]string `json:"headers"`
 }
 
+// XHTTPOptions tunes the XHTTP client; zero values use Xray's defaults.
+type XHTTPOptions struct {
+	XPaddingBytes        [2]int `json:"xPaddingBytes"`        // default 100..1000
+	ScMaxEachPostBytes   int    `json:"scMaxEachPostBytes"`   // default 1000000
+	ScMinPostsIntervalMs int    `json:"scMinPostsIntervalMs"` // default 30
+}
+
 // Advanced holds optional knobs the UI does not need to expose.
 type Advanced struct {
 	SSHCiphers      []string `json:"sshCiphers,omitempty"`
@@ -60,7 +67,8 @@ type Config struct {
 	Protocol    string          `json:"protocol"` // trojan|vless|vmess|shadowsocks|ssh
 	Network     string          `json:"network"`  // tcp (default)|ws|httpupgrade|h2|grpc|quic|xhttp
 	GRPCService string          `json:"grpcService"`
-	XHTTPMode   string          `json:"xhttpMode"` // auto|packet-up|stream-one
+	XHTTPMode   string          `json:"xhttpMode"` // auto|packet-up|stream-up|stream-one
+	XHTTP       *XHTTPOptions   `json:"xhttp,omitempty"`
 	Fragment    *FragmentConfig `json:"fragment,omitempty"`
 	Server      string          `json:"server"`
 	Port        int             `json:"port"`
@@ -125,12 +133,18 @@ func New(cfg *Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	srv := net.JoinHostPort(cfg.Server, fmt.Sprint(cfg.Port))
 	switch net_ {
 	case "", "tcp":
 	case "h2", "http":
 		d = &transport.H2{Inner: d, TLS: cfg.TLS.Enabled, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers}
 	case "xhttp", "splithttp":
-		d = &transport.XHTTP{Inner: d, TLS: cfg.TLS.Enabled, Host: cfg.WS.Host, Path: cfg.WS.Path, Mode: cfg.XHTTPMode, Headers: cfg.WS.Headers}
+		x := &transport.XHTTP{Inner: d, Server: srv, TLS: cfg.TLS.Enabled, SNI: cfg.TLS.SNI, ALPN: alpn,
+			Host: cfg.WS.Host, Path: cfg.WS.Path, Mode: cfg.XHTTPMode, Headers: cfg.WS.Headers}
+		if o := cfg.XHTTP; o != nil {
+			x.XPaddingBytes, x.ScMaxEachPostBytes, x.ScMinPostsIntervalMs = o.XPaddingBytes, o.ScMaxEachPostBytes, o.ScMinPostsIntervalMs
+		}
+		d = x
 	case "grpc":
 		d = &transport.GRPC{Inner: d, TLS: cfg.TLS.Enabled, Host: cfg.WS.Host, Service: cfg.GRPCService}
 	case "quic":
@@ -142,7 +156,6 @@ func New(cfg *Config) (*Client, error) {
 		return nil, fmt.Errorf("v2tun: transport %q not implemented yet", cfg.Network)
 	}
 
-	srv := net.JoinHostPort(cfg.Server, fmt.Sprint(cfg.Port))
 	c := &Client{direct: &transport.TCP{Timeout: to, Resolver: res}, resolver: res}
 	proto := strings.ToLower(cfg.Protocol)
 	switch proto {
