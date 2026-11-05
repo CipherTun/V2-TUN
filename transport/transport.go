@@ -114,13 +114,29 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 }
 
 // Payload sends an HTTP-Injector style payload right after connecting.
+// See package payload for the tag list.
 type Payload struct {
 	Inner          Dialer
 	Template       *payload.Template
 	Host           string // value for [host]; empty => host of addr
 	Method         string
 	UserAgent      string
-	ExpectResponse bool // read and validate the HTTP reply (200/101) before continuing
+	SNI            string            // value for [sni]
+	Vars           map[string]string // values for [var=name]
+	ExpectResponse bool              // read and validate the HTTP reply before continuing
+	ExpectCodes    []int             // accepted status codes; empty => 101 and any 2xx
+}
+
+func codeOK(code int, allowed []int) bool {
+	if len(allowed) == 0 {
+		return code == 101 || (code >= 200 && code < 300)
+	}
+	for _, a := range allowed {
+		if a == code {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -130,17 +146,22 @@ func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Co
 	}
 	h, p, _ := net.SplitHostPort(addr)
 	port, _ := strconv.Atoi(p)
+	ip := h
+	if ra, ok := c.RemoteAddr().(*net.TCPAddr); ok && ra.IP != nil {
+		ip = ra.IP.String() // [ip] / [ip_port]: the address we actually connected to
+	}
 	if d.Host != "" {
 		h = d.Host
 	}
-	segs := d.Template.Render(payload.Context{Host: h, Port: port, Method: d.Method, UserAgent: d.UserAgent})
-	if err := payload.Send(c, segs); err != nil {
+	segs := d.Template.Render(payload.Context{Host: h, Port: port, IP: ip, SNI: d.SNI, Method: d.Method,
+		UserAgent: d.UserAgent, Vars: d.Vars})
+	if err := payload.SendContext(ctx, c, segs); err != nil {
 		c.Close()
 		return nil, err
 	}
 	if d.ExpectResponse {
 		code, err := payload.ReadHTTPHeaders(c)
-		if err != nil || (code != 200 && code != 101) {
+		if err != nil || !codeOK(code, d.ExpectCodes) {
 			c.Close()
 			return nil, fmt.Errorf("payload: server replied %d: %v", code, err)
 		}
