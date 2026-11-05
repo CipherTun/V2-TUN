@@ -3,6 +3,7 @@ package v2tun
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -25,6 +26,15 @@ type TLSConfig struct {
 	ALPN          []string `json:"alpn"`
 	AllowInsecure bool     `json:"allowInsecure"`
 	Fingerprint   string   `json:"fingerprint"` // chrome|firefox|safari|ios|android|edge|random
+}
+
+// RealityConfig enables REALITY in place of the TLS layer (TLS.Enabled is then
+// ignored). Keys use the same encodings as Xray share links.
+type RealityConfig struct {
+	PublicKey   string `json:"publicKey"`   // server X25519 public key, base64url (pbk)
+	ShortID     string `json:"shortId"`     // 0 to 16 hex characters (sid)
+	ServerName  string `json:"serverName"`  // cover site SNI; empty => TLS.SNI, then the server host
+	Fingerprint string `json:"fingerprint"` // empty => TLS.Fingerprint, then chrome
 }
 
 type PayloadConfig struct {
@@ -79,6 +89,7 @@ type Config struct {
 	Method      string          `json:"method"`
 	PrivateKey  string          `json:"privateKey"`
 	TLS         TLSConfig       `json:"tls"`
+	Reality     *RealityConfig  `json:"reality,omitempty"`
 	WS          WSConfig        `json:"ws"`
 	Payload     *PayloadConfig  `json:"payload,omitempty"`
 	Advanced    Advanced        `json:"advanced"`
@@ -113,8 +124,12 @@ func New(cfg *Config) (*Client, error) {
 	if to == 0 {
 		to = 15 * time.Second
 	}
-	// chain: tcp -> [payload pre] -> tls -> [payload post] -> ws/httpupgrade
+	// chain: tcp -> [payload pre] -> tls|reality -> [payload post] -> ws/httpupgrade
 	net_ := strings.ToLower(cfg.Network)
+	if cfg.Reality != nil && net_ == "quic" {
+		return nil, errors.New("v2tun: reality cannot be combined with the quic transport")
+	}
+	tlsOn := cfg.TLS.Enabled || cfg.Reality != nil
 	alpn := cfg.TLS.ALPN
 	if len(alpn) == 0 {
 		switch net_ {
@@ -137,16 +152,16 @@ func New(cfg *Config) (*Client, error) {
 	switch net_ {
 	case "", "tcp":
 	case "h2", "http":
-		d = &transport.H2{Inner: d, TLS: cfg.TLS.Enabled, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers}
+		d = &transport.H2{Inner: d, TLS: tlsOn, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers}
 	case "xhttp", "splithttp":
-		x := &transport.XHTTP{Inner: d, Server: srv, TLS: cfg.TLS.Enabled, SNI: cfg.TLS.SNI, ALPN: alpn,
+		x := &transport.XHTTP{Inner: d, Server: srv, TLS: tlsOn, SNI: cfg.TLS.SNI, ALPN: alpn,
 			Host: cfg.WS.Host, Path: cfg.WS.Path, Mode: cfg.XHTTPMode, Headers: cfg.WS.Headers}
 		if o := cfg.XHTTP; o != nil {
 			x.XPaddingBytes, x.ScMaxEachPostBytes, x.ScMinPostsIntervalMs = o.XPaddingBytes, o.ScMaxEachPostBytes, o.ScMinPostsIntervalMs
 		}
 		d = x
 	case "grpc":
-		d = &transport.GRPC{Inner: d, TLS: cfg.TLS.Enabled, Host: cfg.WS.Host, Service: cfg.GRPCService}
+		d = &transport.GRPC{Inner: d, TLS: tlsOn, Host: cfg.WS.Host, Service: cfg.GRPCService}
 	case "quic":
 	case "ws", "websocket":
 		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers}
@@ -367,7 +382,30 @@ func (c *Client) directUDP(ctx context.Context, addr string) (net.Conn, error) {
 	return &udpConn{PacketConn: pc, remote: &net.UDPAddr{IP: ip, Port: port}}, nil
 }
 
-// baseChain builds tcp -> [payload pre] -> tls -> [payload post] (or QUIC alone).
+// realityDialer validates the REALITY settings and wraps inner with the
+// REALITY client handshake.
+func realityDialer(cfg *Config, inner transport.Dialer, alpn []string) (transport.Dialer, error) {
+	r := cfg.Reality
+	pk, err := b64(r.PublicKey)
+	if err != nil || len(pk) != 32 {
+		return nil, errors.New("v2tun: reality publicKey must be a base64 X25519 key (32 bytes)")
+	}
+	sid, err := hex.DecodeString(r.ShortID)
+	if err != nil || len(sid) > 8 {
+		return nil, errors.New("v2tun: reality shortId must be at most 16 hex characters")
+	}
+	sni := r.ServerName
+	if sni == "" {
+		sni = cfg.TLS.SNI
+	}
+	fp := r.Fingerprint
+	if fp == "" {
+		fp = cfg.TLS.Fingerprint
+	}
+	return &transport.Reality{Inner: inner, ServerName: sni, PublicKey: pk, ShortID: sid, Fingerprint: fp, ALPN: alpn}, nil
+}
+
+// baseChain builds tcp -> [payload pre] -> tls|reality -> [payload post] (or QUIC alone).
 func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *net.Resolver) (transport.Dialer, error) {
 	if net_ == "quic" { // QUIC carries its own TLS; payload and TLS layers don't apply
 		return &transport.QUIC{ServerName: cfg.TLS.SNI, ALPN: cfg.TLS.ALPN, AllowInsecure: cfg.TLS.AllowInsecure, Resolver: res}, nil
@@ -390,7 +428,14 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 		pd.Inner = d
 		d = pd
 	}
-	if cfg.TLS.Enabled {
+	switch {
+	case cfg.Reality != nil:
+		rd, err := realityDialer(cfg, d, alpn)
+		if err != nil {
+			return nil, err
+		}
+		d = rd
+	case cfg.TLS.Enabled:
 		d = &transport.TLS{Inner: d, ServerName: cfg.TLS.SNI, ALPN: alpn,
 			AllowInsecure: cfg.TLS.AllowInsecure, Fingerprint: cfg.TLS.Fingerprint}
 	}
