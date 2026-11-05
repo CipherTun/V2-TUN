@@ -52,6 +52,12 @@ var fingerprints = map[string]utls.ClientHelloID{
 	"random":  utls.HelloRandomized,
 }
 
+// KnownFingerprint reports whether name is a supported uTLS fingerprint.
+func KnownFingerprint(name string) bool {
+	_, ok := fingerprints[strings.ToLower(name)]
+	return ok
+}
+
 func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	c, err := d.Inner.DialContext(ctx, network, addr)
 	if err != nil {
@@ -70,11 +76,23 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 			return nil, err
 		}
 		if len(d.ALPN) > 0 { // force our ALPN into the browser preset
-			for _, ext := range uc.Extensions {
-				if a, ok := ext.(*utls.ALPNExtension); ok {
-					a.AlpnProtocols = d.ALPN
-				}
+			hasH2 := false
+			for _, p := range d.ALPN {
+				hasH2 = hasH2 || p == "h2"
 			}
+			kept := uc.Extensions[:0]
+			for _, ext := range uc.Extensions {
+				switch e := ext.(type) {
+				case *utls.ALPNExtension:
+					e.AlpnProtocols = d.ALPN
+				case *utls.ApplicationSettingsExtension, *utls.ApplicationSettingsExtensionNew:
+					if !hasH2 { // ALPS only makes sense when h2 is offered
+						continue
+					}
+				}
+				kept = append(kept, ext)
+			}
+			uc.Extensions = kept
 		}
 		if err := uc.HandshakeContext(ctx); err != nil {
 			c.Close()
