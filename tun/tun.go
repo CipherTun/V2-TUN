@@ -98,12 +98,14 @@ func Start(o Options) (*Tun, error) {
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tf.HandlePacket)
 
-	uf := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
+	// gVisor's udp.NewForwarder takes a handler with no return value; the
+	// forwarder's own HandlePacket reports the packet as handled.
+	uf := udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
 		id := r.ID()
 		var wq waiter.Queue
 		e, err := r.CreateEndpoint(&wq)
 		if err != nil {
-			return false
+			return
 		}
 		c := gonet.NewUDPConn(&wq, e)
 		dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
@@ -119,7 +121,6 @@ func Start(o Options) (*Tun, error) {
 		default:
 			c.Close() // no UDP support: drop
 		}
-		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, uf.HandlePacket)
 	return t, nil
