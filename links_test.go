@@ -28,12 +28,44 @@ func TestParseVLESS(t *testing.T) {
 	}
 }
 
-func TestVLESSFlowAndRealityRejected(t *testing.T) {
+func TestVLESSFlowRejected(t *testing.T) {
 	base := "vless://11111111-2222-3333-4444-555555555555@example.com:443?"
-	for _, q := range []string{"flow=xtls-rprx-vision&security=tls", "security=reality&pbk=x"} {
+	for _, q := range []string{"flow=xtls-rprx-vision&security=tls"} {
 		if _, _, err := ParseLink(base + q); err == nil {
 			t.Errorf("%q: expected an error", q)
 		}
+	}
+}
+
+func TestParseVLESSReality(t *testing.T) {
+	pbk := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	cfg, name, err := ParseLink("vless://11111111-2222-3333-4444-555555555555@example.com:443" +
+		"?type=tcp&security=reality&pbk=" + pbk + "&sid=abcd1234&sni=cover.example.com&fp=chrome#R")
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := cfg.Reality
+	if r == nil {
+		t.Fatal("reality settings missing")
+	}
+	if r.PublicKey != pbk || r.ShortID != "abcd1234" || r.ServerName != "cover.example.com" || r.Fingerprint != "chrome" {
+		t.Fatalf("reality: %+v", r)
+	}
+	if cfg.TLS.Enabled {
+		t.Fatal("reality replaces the TLS layer; TLS.Enabled must stay false")
+	}
+	if name != "R" {
+		t.Fatalf("name: %q", name)
+	}
+	// the parsed config must be accepted by New
+	if _, err := New(cfg); err != nil {
+		t.Fatalf("New rejected a parsed reality config: %v", err)
+	}
+}
+
+func TestRealityLinkNeedsPublicKey(t *testing.T) {
+	if _, _, err := ParseLink("vless://11111111-2222-3333-4444-555555555555@example.com:443?security=reality&sid=ab"); err == nil {
+		t.Fatal("a reality link without pbk must be rejected")
 	}
 }
 
