@@ -6,12 +6,15 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go"
 )
 
 // QUIC is a base transport (replaces TCP): one bidirectional QUIC stream per dial.
+// Written against quic-go v0.65, where connections and streams are the concrete
+// types *quic.Conn and *quic.Stream.
 type QUIC struct {
 	ServerName    string
 	ALPN          []string
@@ -20,20 +23,25 @@ type QUIC struct {
 }
 
 type quicConn struct {
-	quic.Stream
-	qc quic.Connection
-	pc net.PacketConn
+	*quic.Stream
+	qc   *quic.Conn
+	pc   net.PacketConn
+	once sync.Once
 }
 
 func (c *quicConn) LocalAddr() net.Addr  { return c.qc.LocalAddr() }
 func (c *quicConn) RemoteAddr() net.Addr { return c.qc.RemoteAddr() }
+
 func (c *quicConn) Close() error {
-	c.Stream.CancelRead(0)
-	c.Stream.Close()
-	err := c.qc.CloseWithError(0, "")
-	// quic.Dial does not own a PacketConn passed to it; without this every
-	// connection leaks one UDP socket.
-	c.pc.Close()
+	var err error
+	c.once.Do(func() {
+		c.Stream.CancelRead(0)
+		c.Stream.Close()
+		err = c.qc.CloseWithError(0, "")
+		// quic.Dial does not own a PacketConn passed to it; without this every
+		// connection leaks one UDP socket.
+		c.pc.Close()
+	})
 	return err
 }
 
