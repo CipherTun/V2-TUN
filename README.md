@@ -16,7 +16,7 @@ Android: `gomobile bind -target=android -javapkg=io.surprise -o v2tun.aar io.sur
 ## Protocols
 | `protocol` | Notes |
 | --- | --- |
-| `vless`, `vmess`, `trojan`, `shadowsocks` | TCP and UDP, Mux.Cool, any transport below |
+| `vless`, `vmess`, `trojan`, `shadowsocks` | TCP and UDP, Mux.Cool, any transport below; `vless` also takes `flow: xtls-rprx-vision` (see XTLS Vision) |
 | `ssh` | direct-tcpip; UDP through udpgw. TLS is optional, see SSH over WebSocket |
 | `socks5` (`socks`) | CONNECT, optional username/password; UDP through udpgw |
 | `socks4` (`socks4a`) | CONNECT; the user id is `username`; host names use SOCKS4a |
@@ -64,7 +64,7 @@ Without a map, `101` and any `2xx` are accepted; `expectCodes` replaces that lis
 
 ## Transports
 tcp, ws, httpupgrade, h2 (http), grpc (gun, no grpc lib), quic (single stream), xhttp. TLS: allowInsecure, SNI, ALPN, uTLS fingerprints.
-Not yet: mKCP, the REALITY spiderX crawl, XTLS Vision flow.
+Not yet: mKCP, the REALITY spiderX crawl.
 
 ## Payload (HTTP Injector style)
 `"payload": {"template": "@connect", "host": "bug.example.com", "stage": "pre-tls", "expectResponse": true, "expectResponses": 1, "expectCodes": [200], "responseMap": {"301": 200}, "vars": {"token": "abc"}, "proxy": "1.2.3.4:8080"}`
@@ -77,8 +77,15 @@ Not yet: mKCP, the REALITY spiderX crawl, XTLS Vision flow.
 ## REALITY
 Set `"reality": {"publicKey": "<pbk>", "shortId": "<sid hex>", "serverName": "<cover site>", "fingerprint": "chrome"}`
 (it replaces the `tls` layer; it works with tcp, h2, grpc and xhttp, not quic). Share links with `security=reality&pbk=..&sid=..&sni=..&fp=..`
-are parsed by `ParseLink`. Links that carry `flow=xtls-rprx-vision` are rejected because Vision is not implemented; use a server inbound
-without a flow. A wrong key, shortId or server name fails with a clear error instead of hanging. Test it against your own server before relying on it.
+are parsed by `ParseLink`. A wrong key, shortId or server name fails with a clear error instead of hanging. Test it against your own server before relying on it.
+
+## XTLS Vision
+Set `"flow": "xtls-rprx-vision"` on a `vless` config, or use a share link with `flow=xtls-rprx-vision` (`-udp443` is accepted too). It needs the plain
+`tcp` transport with `tls.enabled` or `reality`. `New` and `ParseLink` reject it with ws/h2/grpc/xhttp/quic, without TLS or REALITY, with `mux`, and on any
+protocol other than `vless` (hysteria brings its own QUIC/TLS, so it never applies there). A pre-tls `payload` and `fragment` still work: the record layer
+Vision needs sits directly under TLS/REALITY, above them.
+The client pads the inner TLS handshake and follows the server's switch to direct copy. It is based on Xray-core's behaviour and has only been
+tested against its own framing, not a live server, so try it against your own inbound before relying on it. Other flows are rejected.
 
 ## TUN (Android)
 1. `go get gvisor.dev/gvisor@go && go mod tidy`
