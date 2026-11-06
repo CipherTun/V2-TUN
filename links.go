@@ -20,14 +20,16 @@ func b64(s string) ([]byte, error) {
 
 func truthy(s string) bool { s = strings.ToLower(s); return s == "1" || s == "true" }
 
-// ParseLink converts a share link (vless://, vmess://, trojan://, ss://, ssh://)
-// into a Config and the display name.
+// ParseLink converts a share link (vless://, vmess://, trojan://, ss://,
+// ssh://, socks5://, socks4://, http://, https://) into a Config and the
+// display name.
 //
 // Features the library cannot honor are rejected with an error instead of
 // being dropped silently (which would only show up later as a connection that
 // never works): VLESS flow (xtls-rprx-vision) and Shadowsocks plugins.
 // REALITY links (security=reality with pbk, sid, sni, fp) are supported; the
-// spiderX crawl (spx) is ignored.
+// spiderX crawl (spx) is ignored. http:// and https:// links describe an HTTP
+// proxy (https uses TLS to the proxy), socks:// links a SOCKS proxy.
 func ParseLink(link string) (*Config, string, error) {
 	link = strings.TrimSpace(link)
 	scheme, rest, ok := strings.Cut(link, "://")
@@ -39,7 +41,7 @@ func ParseLink(link string) (*Config, string, error) {
 		return parseVMess(rest)
 	case "ss":
 		return parseSS(rest)
-	case "vless", "trojan", "ssh":
+	case "vless", "trojan", "ssh", "socks", "socks5", "socks5h", "socks4", "socks4a", "http", "https":
 		return parseURLLink(strings.ToLower(scheme), link)
 	}
 	return nil, "", fmt.Errorf("link: unsupported scheme %q", scheme)
@@ -97,11 +99,13 @@ func parseURLLink(scheme, link string) (*Config, string, error) {
 		return nil, "", err
 	}
 	port, _ := strconv.Atoi(u.Port())
-	if port == 0 && scheme == "ssh" {
-		port = 22
-	}
 	cfg := &Config{Protocol: scheme, Server: u.Hostname(), Port: port}
 	pw, _ := u.User.Password()
+	defPort := func(p int) {
+		if cfg.Port == 0 {
+			cfg.Port = p
+		}
+	}
 	switch scheme {
 	case "vless":
 		cfg.UUID = u.User.Username()
@@ -110,6 +114,22 @@ func parseURLLink(scheme, link string) (*Config, string, error) {
 		cfg.TLS.Enabled = true // trojan defaults to TLS
 	case "ssh":
 		cfg.Username, cfg.Password = u.User.Username(), pw
+		defPort(22)
+	case "socks", "socks5", "socks5h":
+		cfg.Protocol = "socks5"
+		cfg.Username, cfg.Password = u.User.Username(), pw
+		defPort(1080)
+	case "socks4", "socks4a":
+		cfg.Protocol = "socks4"
+		cfg.Username, cfg.Password = u.User.Username(), pw
+		defPort(1080)
+	case "http":
+		cfg.Username, cfg.Password = u.User.Username(), pw
+		defPort(8080)
+	case "https":
+		cfg.Username, cfg.Password = u.User.Username(), pw
+		cfg.TLS.Enabled = true
+		defPort(443)
 	}
 	q := u.Query()
 	if scheme == "vless" && q.Get("flow") != "" {
@@ -124,7 +144,7 @@ func parseURLLink(scheme, link string) (*Config, string, error) {
 		if err := applyQuery(cfg, q); err != nil {
 			return nil, "", err
 		}
-		if scheme == "trojan" && q.Get("security") == "" {
+		if (scheme == "trojan" || scheme == "https") && q.Get("security") == "" {
 			cfg.TLS.Enabled = keep
 		}
 	}

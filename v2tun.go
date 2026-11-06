@@ -37,13 +37,22 @@ type RealityConfig struct {
 	Fingerprint string `json:"fingerprint"` // empty => TLS.Fingerprint, then chrome
 }
 
+// PayloadConfig is the HTTP-Injector style payload sent right after the TCP
+// connect (or after TLS with Stage "post-tls"). See package payload for tags.
 type PayloadConfig struct {
-	Template       string `json:"template"`
-	Host           string `json:"host"`
-	Method         string `json:"method"`
-	UserAgent      string `json:"userAgent"`
-	Stage          string `json:"stage"` // "pre-tls" (default) or "post-tls"
-	ExpectResponse bool   `json:"expectResponse"`
+	Template       string            `json:"template"` // a template or a preset such as "@connect"
+	Host           string            `json:"host"`     // value for [host]; empty => server host
+	Method         string            `json:"method"`
+	UserAgent      string            `json:"userAgent"`
+	Stage          string            `json:"stage"` // "pre-tls" (default) or "post-tls"
+	ExpectResponse bool              `json:"expectResponse"`
+	ExpectCodes    []int             `json:"expectCodes,omitempty"` // accepted status codes; empty => 101 and any 2xx
+	Vars           map[string]string `json:"vars,omitempty"`        // values for [var=name]
+	// Proxy ("host:port") is HTTP-Injector's remote proxy mode: the TCP
+	// connection goes to this proxy, the payload names the real server in
+	// [host_port], and the proxy's reply is checked (expectResponse is implied).
+	// It needs the pre-tls stage.
+	Proxy string `json:"proxy,omitempty"`
 }
 
 // FragmentConfig splits the TLS ClientHello: Length bytes per piece, Interval ms between.
@@ -74,30 +83,34 @@ type Advanced struct {
 }
 
 type Config struct {
-	Protocol    string          `json:"protocol"` // trojan|vless|vmess|shadowsocks|ssh
-	Network     string          `json:"network"`  // tcp (default)|ws|httpupgrade|h2|grpc|quic|xhttp
-	GRPCService string          `json:"grpcService"`
-	XHTTPMode   string          `json:"xhttpMode"` // auto|packet-up|stream-up|stream-one
-	XHTTP       *XHTTPOptions   `json:"xhttp,omitempty"`
-	Fragment    *FragmentConfig `json:"fragment,omitempty"`
-	Server      string          `json:"server"`
-	Port        int             `json:"port"`
-	UUID        string          `json:"uuid"`
-	AlterID     int             `json:"alterId"`
-	Password    string          `json:"password"`
-	Username    string          `json:"username"`
-	Method      string          `json:"method"`
-	PrivateKey  string          `json:"privateKey"`
-	TLS         TLSConfig       `json:"tls"`
-	Reality     *RealityConfig  `json:"reality,omitempty"`
-	WS          WSConfig        `json:"ws"`
-	Payload     *PayloadConfig  `json:"payload,omitempty"`
-	Advanced    Advanced        `json:"advanced"`
-	Routing     *route.Config   `json:"routing,omitempty"`
-	Mux         *MuxConfig      `json:"mux,omitempty"`
-	UDPGW       string          `json:"udpgw"`     // BadVPN udpgw address as seen from the server, e.g. "127.0.0.1:7300"
-	DirectDNS   string          `json:"directDns"` // resolver for hostnames, bypasses the VPN (default 1.1.1.1:53)
-	TimeoutSec  int             `json:"timeoutSec"`
+	// Protocol: trojan|vless|vmess|shadowsocks|ssh|socks5|socks4|http|https
+	// ("socks" is socks5, "socks4a" is socks4; "https" is an http proxy that
+	// needs tls.enabled).
+	Protocol     string            `json:"protocol"`
+	Network      string            `json:"network"` // tcp (default)|ws|httpupgrade|h2|grpc|quic|xhttp
+	GRPCService  string            `json:"grpcService"`
+	XHTTPMode    string            `json:"xhttpMode"` // auto|packet-up|stream-up|stream-one
+	XHTTP        *XHTTPOptions     `json:"xhttp,omitempty"`
+	Fragment     *FragmentConfig   `json:"fragment,omitempty"`
+	Server       string            `json:"server"`
+	Port         int               `json:"port"`
+	UUID         string            `json:"uuid"`
+	AlterID      int               `json:"alterId"`
+	Password     string            `json:"password"`
+	Username     string            `json:"username"`
+	Method       string            `json:"method"`
+	PrivateKey   string            `json:"privateKey"`
+	ProxyHeaders map[string]string `json:"proxyHeaders,omitempty"` // extra headers for the http/https proxy CONNECT
+	TLS          TLSConfig         `json:"tls"`
+	Reality      *RealityConfig    `json:"reality,omitempty"`
+	WS           WSConfig          `json:"ws"`
+	Payload      *PayloadConfig    `json:"payload,omitempty"`
+	Advanced     Advanced          `json:"advanced"`
+	Routing      *route.Config     `json:"routing,omitempty"`
+	Mux          *MuxConfig        `json:"mux,omitempty"`
+	UDPGW        string            `json:"udpgw"`     // BadVPN udpgw address as seen from the server, e.g. "127.0.0.1:7300"
+	DirectDNS    string            `json:"directDns"` // resolver for hostnames, bypasses the VPN (default 1.1.1.1:53)
+	TimeoutSec   int               `json:"timeoutSec"`
 }
 
 type MuxConfig struct {
@@ -173,24 +186,34 @@ func New(cfg *Config) (*Client, error) {
 
 	c := &Client{direct: &transport.TCP{Timeout: to, Resolver: res}, resolver: res}
 	proto := strings.ToLower(cfg.Protocol)
+	muxable := false
 	switch proto {
 	case "trojan":
-		c.out = &proxy.Trojan{Server: srv, Dialer: d, Password: cfg.Password}
+		c.out, muxable = &proxy.Trojan{Server: srv, Dialer: d, Password: cfg.Password}, true
 	case "vless":
-		c.out = &proxy.VLESS{Server: srv, Dialer: d, UUID: cfg.UUID}
+		c.out, muxable = &proxy.VLESS{Server: srv, Dialer: d, UUID: cfg.UUID}, true
 	case "vmess":
-		c.out = &proxy.VMess{Server: srv, Dialer: d, UUID: cfg.UUID, AlterID: cfg.AlterID, Security: cfg.Method}
+		c.out, muxable = &proxy.VMess{Server: srv, Dialer: d, UUID: cfg.UUID, AlterID: cfg.AlterID, Security: cfg.Method}, true
 	case "shadowsocks", "ss":
-		c.out = &proxy.Shadowsocks{Server: srv, Dialer: d, Method: cfg.Method, Password: cfg.Password}
+		c.out, muxable = &proxy.Shadowsocks{Server: srv, Dialer: d, Method: cfg.Method, Password: cfg.Password}, true
 	case "ssh":
 		c.out = &proxy.SSH{Server: srv, Dialer: d, User: cfg.Username,
 			Password: cfg.Password, PrivateKey: readKey(cfg.PrivateKey),
 			Options: proxy.SSHOptions{Ciphers: cfg.Advanced.SSHCiphers, KeyExchanges: cfg.Advanced.SSHKeyExchanges,
 				MACs: cfg.Advanced.SSHMACs, HostKeyAlgos: cfg.Advanced.SSHHostKeys}}
+	case "socks", "socks5":
+		c.out = &proxy.SOCKS{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Version: 5}
+	case "socks4", "socks4a":
+		c.out = &proxy.SOCKS{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Version: 4}
+	case "http", "https":
+		if proto == "https" && !tlsOn {
+			return nil, errors.New("v2tun: an https proxy needs tls.enabled")
+		}
+		c.out = &proxy.HTTPProxy{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Headers: cfg.ProxyHeaders}
 	default:
 		return nil, fmt.Errorf("v2tun: unknown protocol %q", cfg.Protocol)
 	}
-	if cfg.Mux != nil && cfg.Mux.Enabled && proto != "ssh" {
+	if cfg.Mux != nil && cfg.Mux.Enabled && muxable {
 		c.out = &proxy.Mux{Base: c.out, Concurrency: cfg.Mux.Concurrency}
 	}
 	if cfg.UDPGW != "" {
@@ -414,6 +437,10 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 	if f := cfg.Fragment; f != nil {
 		d = &transport.Fragment{Inner: d, LenMin: f.Length[0], LenMax: f.Length[1], IntMin: f.Interval[0], IntMax: f.Interval[1]}
 	}
+	psni := cfg.TLS.SNI // value for the payload's [sni]
+	if cfg.Reality != nil && cfg.Reality.ServerName != "" {
+		psni = cfg.Reality.ServerName
+	}
 	var pd *transport.Payload
 	if p := cfg.Payload; p != nil && p.Template != "" {
 		tpl, err := payload.Compile(p.Template)
@@ -421,9 +448,19 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 			return nil, err
 		}
 		pd = &transport.Payload{Template: tpl, Host: p.Host, Method: p.Method,
-			UserAgent: p.UserAgent, ExpectResponse: p.ExpectResponse}
+			UserAgent: p.UserAgent, SNI: psni, Vars: p.Vars,
+			ExpectResponse: p.ExpectResponse || p.Proxy != "", ExpectCodes: p.ExpectCodes}
 	}
 	post := pd != nil && cfg.Payload.Stage == "post-tls"
+	if pd != nil && cfg.Payload.Proxy != "" {
+		if post {
+			return nil, errors.New("v2tun: a payload proxy needs the pre-tls stage")
+		}
+		if _, _, err := net.SplitHostPort(cfg.Payload.Proxy); err != nil {
+			return nil, fmt.Errorf("v2tun: payload proxy must be host:port: %v", err)
+		}
+		d = &transport.Via{Inner: d, Addr: cfg.Payload.Proxy}
+	}
 	if pd != nil && !post {
 		pd.Inner = d
 		d = pd
