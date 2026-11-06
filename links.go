@@ -26,9 +26,10 @@ func truthy(s string) bool { s = strings.ToLower(s); return s == "1" || s == "tr
 //
 // Features the library cannot honor are rejected with an error instead of
 // being dropped silently (which would only show up later as a connection that
-// never works): VLESS flow (xtls-rprx-vision), Shadowsocks plugins, Hysteria
-// port hopping, faketcp and wechat-video. REALITY links (security=reality with
-// pbk, sid, sni, fp) are supported; the spiderX crawl (spx) is ignored.
+// never works): VLESS flows other than xtls-rprx-vision, Vision without TLS or
+// REALITY (or on a non-tcp transport), Shadowsocks plugins, Hysteria port
+// hopping, faketcp and wechat-video. REALITY links (security=reality with pbk,
+// sid, sni, fp) are supported; the spiderX crawl (spx) is ignored.
 // http:// and https:// links describe an HTTP proxy (https uses TLS to the
 // proxy), socks:// links a SOCKS proxy.
 func ParseLink(link string) (*Config, string, error) {
@@ -137,7 +138,10 @@ func parseURLLink(scheme, link string) (*Config, string, error) {
 	q := u.Query()
 	if scheme == "vless" && q.Get("flow") != "" {
 		// A server that expects a flow rejects clients that do not speak it.
-		return nil, "", fmt.Errorf("link: vless flow %q is not supported", q.Get("flow"))
+		cfg.Flow = strings.ToLower(q.Get("flow"))
+		if f := cfg.Flow; f != "xtls-rprx-vision" && f != "xtls-rprx-vision-udp443" {
+			return nil, "", fmt.Errorf("link: vless flow %q is not supported", q.Get("flow"))
+		}
 	}
 	if scheme == "trojan" && strings.EqualFold(q.Get("security"), "none") {
 		cfg.TLS.Enabled = false
@@ -150,6 +154,9 @@ func parseURLLink(scheme, link string) (*Config, string, error) {
 		if (scheme == "trojan" || scheme == "https") && q.Get("security") == "" {
 			cfg.TLS.Enabled = keep
 		}
+	}
+	if err := checkFlow(cfg); err != nil {
+		return nil, "", fmt.Errorf("link: %w", err)
 	}
 	return cfg, u.Fragment, nil
 }
