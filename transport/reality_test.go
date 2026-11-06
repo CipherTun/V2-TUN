@@ -2,6 +2,8 @@ package transport
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"net"
 	"testing"
 
@@ -20,8 +22,11 @@ func TestRealityHelloLayoutAndKey(t *testing.T) {
 		t.Fatal(err)
 	}
 	h := uc.HandshakeState.Hello
-	if h == nil || len(h.Raw) < 71 || h.Raw[38] != 32 || len(h.Random) != 32 {
-		t.Fatalf("unexpected hello layout (raw %d bytes)", len(h.Raw))
+	if h == nil {
+		t.Fatal("no ClientHello after BuildHandshakeState")
+	}
+	if len(h.Raw) < 71 || h.Raw[38] != 32 || len(h.Random) != 32 {
+		t.Fatalf("unexpected hello layout (raw %d bytes, random %d bytes)", len(h.Raw), len(h.Random))
 	}
 	key, err := x25519Key(uc)
 	if err != nil {
@@ -32,12 +37,21 @@ func TestRealityHelloLayoutAndKey(t *testing.T) {
 	}
 }
 
+// realityMustNotDial fails the test if it is ever used: invalid parameters
+// have to be rejected before anything touches the network.
+type realityMustNotDial struct{ t *testing.T }
+
+func (d realityMustNotDial) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	d.t.Error("the inner dialer was called although the parameters are invalid")
+	return nil, errors.New("must not dial")
+}
+
 func TestRealityRejectsBadParameters(t *testing.T) {
-	d := &Reality{Inner: &TCP{}, PublicKey: make([]byte, 31)}
+	d := &Reality{Inner: realityMustNotDial{t}, PublicKey: make([]byte, 31)}
 	if _, err := d.DialContext(t.Context(), "tcp", "127.0.0.1:1"); err == nil {
 		t.Fatal("short public key must be rejected")
 	}
-	d = &Reality{Inner: &TCP{}, PublicKey: make([]byte, 32), ShortID: make([]byte, 9)}
+	d = &Reality{Inner: realityMustNotDial{t}, PublicKey: make([]byte, 32), ShortID: make([]byte, 9)}
 	if _, err := d.DialContext(t.Context(), "tcp", "127.0.0.1:1"); err == nil {
 		t.Fatal("long shortId must be rejected")
 	}
