@@ -2,6 +2,7 @@ package v2tun
 
 import (
 	"encoding/base64"
+	"strings"
 	"testing"
 )
 
@@ -30,10 +31,67 @@ func TestParseVLESS(t *testing.T) {
 
 func TestVLESSFlowRejected(t *testing.T) {
 	base := "vless://11111111-2222-3333-4444-555555555555@example.com:443?"
-	for _, q := range []string{"flow=xtls-rprx-vision&security=tls"} {
+	for _, q := range []string{
+		"flow=xtls-rprx-vision",                        // no TLS or REALITY
+		"flow=xtls-rprx-vision&security=none",          // explicitly none
+		"flow=xtls-rprx-vision&security=tls&type=ws",   // Vision needs plain tcp
+		"flow=xtls-rprx-vision&security=tls&type=grpc", // ditto
+		"flow=xtls-rprx-direct&security=tls",           // an unsupported flow
+		"flow=xtls-rprx-splice&security=tls&type=tcp",  // ditto
+	} {
 		if _, _, err := ParseLink(base + q); err == nil {
 			t.Errorf("%q: expected an error", q)
 		}
+	}
+}
+
+func TestParseVLESSVision(t *testing.T) {
+	base := "vless://11111111-2222-3333-4444-555555555555@example.com:443?"
+	pbk := base64.RawURLEncoding.EncodeToString(make([]byte, 32))
+	for _, q := range []string{
+		"type=tcp&security=tls&sni=example.com&flow=xtls-rprx-vision",
+		"security=tls&flow=XTLS-RPRX-VISION",
+		"security=tls&flow=xtls-rprx-vision-udp443",
+		"type=tcp&security=reality&pbk=" + pbk + "&sid=abcd&sni=cover.example.com&fp=chrome&flow=xtls-rprx-vision",
+	} {
+		cfg, _, err := ParseLink(base + q)
+		if err != nil {
+			t.Fatalf("%q: %v", q, err)
+		}
+		if cfg.Flow == "" || cfg.Flow != strings.ToLower(cfg.Flow) {
+			t.Fatalf("%q: flow = %q", q, cfg.Flow)
+		}
+		if _, err := New(cfg); err != nil {
+			t.Fatalf("%q: New rejected the parsed config: %v", q, err)
+		}
+	}
+}
+
+func TestVisionConfigValidation(t *testing.T) {
+	mk := func(mut func(*Config)) error {
+		cfg := &Config{Protocol: "vless", UUID: "11111111-2222-3333-4444-555555555555", Server: "example.com", Port: 443,
+			Flow: "xtls-rprx-vision", TLS: TLSConfig{Enabled: true}}
+		mut(cfg)
+		_, err := New(cfg)
+		return err
+	}
+	if err := mk(func(*Config) {}); err != nil {
+		t.Fatalf("valid Vision config rejected: %v", err)
+	}
+	if mk(func(c *Config) { c.TLS.Enabled = false }) == nil {
+		t.Error("Vision without TLS or REALITY must be rejected")
+	}
+	if mk(func(c *Config) { c.Network = "ws" }) == nil {
+		t.Error("Vision over ws must be rejected")
+	}
+	if mk(func(c *Config) { c.Mux = &MuxConfig{Enabled: true} }) == nil {
+		t.Error("Vision with mux must be rejected")
+	}
+	if mk(func(c *Config) { c.Protocol = "trojan" }) == nil {
+		t.Error("flow on a non-vless protocol must be rejected")
+	}
+	if mk(func(c *Config) { c.Flow = "xtls-rprx-direct" }) == nil {
+		t.Error("an unsupported flow must be rejected")
 	}
 }
 
