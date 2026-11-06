@@ -51,7 +51,7 @@ func (d *Reality) DialContext(ctx context.Context, network, addr string) (net.Co
 	if err != nil {
 		return nil, err
 	}
-	uc, err := d.handshake(ctx, NewRecordConn(c), addr)
+	uc, err := d.handshake(ctx, c, addr)
 	if err != nil {
 		c.Close()
 		return nil, err

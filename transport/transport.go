@@ -63,7 +63,6 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 	if err != nil {
 		return nil, err
 	}
-	c = NewRecordConn(c) // lets XTLS Vision follow a server "direct copy" switch
 	host, _, _ := net.SplitHostPort(addr)
 	sni := d.ServerName
 	if sni == "" {

@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -12,10 +13,13 @@ import (
 )
 
 // VLESS supports plaintext (no TLS in the chain) as well as TLS.
+// Flow "xtls-rprx-vision" enables XTLS Vision for TCP; it needs a TLS or
+// REALITY layer over plain TCP with a transport.RecordDialer directly below it.
 type VLESS struct {
 	Server string
 	Dialer transport.Dialer
 	UUID   string
+	Flow   string
 }
 
 func parseUUID(s string) ([16]byte, error) {
@@ -50,13 +54,25 @@ func (v *VLESS) dial(ctx context.Context, target string, cmd byte) (net.Conn, er
 	if err != nil {
 		return nil, err
 	}
+	vision := cmd == 1 && strings.HasPrefix(strings.ToLower(v.Flow), visionFlow)
 	c, err := v.Dialer.DialContext(ctx, "tcp", v.Server)
 	if err != nil {
 		return nil, err
 	}
-	hdr := []byte{0}           // version
+	var rc *transport.RecordConn
+	var addons []byte
+	if vision {
+		if rc = findRecordConn(c); rc == nil {
+			c.Close()
+			return nil, errors.New("vless: flow xtls-rprx-vision needs TLS or REALITY over plain TCP")
+		}
+		addons = append([]byte{0x0a, byte(len(v.Flow))}, v.Flow...) // protobuf: field 1 = flow
+	}
+	hdr := []byte{0}            // version
 	hdr = append(hdr, id[:]...) // user id
-	hdr = append(hdr, 0, cmd) // addons len 0; cmd 1 tcp, 2 udp
+	hdr = append(hdr, byte(len(addons)))
+	hdr = append(hdr, addons...)
+	hdr = append(hdr, cmd) // 1 tcp, 2 udp, 3 mux
 	if cmd != 3 {
 		hdr = append(hdr, a.vless()...)
 	}
@@ -64,7 +80,11 @@ func (v *VLESS) dial(ctx context.Context, target string, cmd byte) (net.Conn, er
 		c.Close()
 		return nil, err
 	}
-	return &vlessConn{Conn: c}, nil
+	vc := &vlessConn{Conn: c}
+	if vision {
+		return newVisionConn(vc, id[:], rc), nil
+	}
+	return vc, nil
 }
 
 // vlessConn strips the response header (version + addons) on first read.
