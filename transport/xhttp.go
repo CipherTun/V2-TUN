@@ -49,6 +49,7 @@ type XHTTP struct {
 	ScMaxEachPostBytes   int    // default 1_000_000
 	ScMinPostsIntervalMs int    // default 30
 
+	srvOnce sync.Once // Server defaults to the first dial address; set once, race free
 	once    sync.Once
 	client  *http.Client
 	initErr error
@@ -194,9 +195,11 @@ func (a xAddr) Network() string { return "tcp" }
 func (a xAddr) String() string  { return string(a) }
 
 func (d *XHTTP) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	if d.Server == "" {
-		d.Server = addr
-	}
+	d.srvOnce.Do(func() {
+		if d.Server == "" {
+			d.Server = addr
+		}
+	})
 	if err := d.setup(); err != nil {
 		return nil, err
 	}
