@@ -60,7 +60,9 @@ func (s *h2Stream) SetWriteDeadline(time.Time) error { return nil }
 
 // openH2 starts the POST asynchronously (servers like grpc-go may send headers lazily).
 func openH2(ctx context.Context, raw net.Conn, tlsOn bool, host, path string, hdr map[string]string) (*h2Stream, error) {
-	cc, err := (&http2.Transport{AllowHTTP: true}).NewClientConn(raw)
+	// HTTP/2 PING frames detect a dead path: without them a connection that a
+	// NAT or middlebox silently dropped stays "open" until the OS gives up.
+	cc, err := (&http2.Transport{AllowHTTP: true, ReadIdleTimeout: 45 * time.Second, PingTimeout: 15 * time.Second}).NewClientConn(raw)
 	if err != nil {
 		raw.Close()
 		return nil, err
