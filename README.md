@@ -26,7 +26,7 @@ Share links: `socks5://user:pass@host:1080`, `socks4://host:1080`, `http://user:
 
 ## Transports
 tcp, ws, httpupgrade, h2 (http), grpc (gun, no grpc lib), quic (single stream), xhttp. TLS: allowInsecure, SNI, ALPN, uTLS fingerprints.
-Not yet: mKCP, the REALITY spiderX crawl, XTLS Vision flow.
+Not yet: mKCP, the REALITY spiderX crawl.
 
 ## Payload (HTTP Injector style)
 `"payload": {"template": "@connect", "host": "bug.example.com", "stage": "pre-tls", "expectResponse": true, "expectCodes": [200], "vars": {"token": "abc"}, "proxy": "1.2.3.4:8080"}`
@@ -41,8 +41,13 @@ Example, SSH through an HTTP proxy with a CONNECT payload:
 ## REALITY
 Set `"reality": {"publicKey": "<pbk>", "shortId": "<sid hex>", "serverName": "<cover site>", "fingerprint": "chrome"}`
 (it replaces the `tls` layer; it works with tcp, h2, grpc and xhttp, not quic). Share links with `security=reality&pbk=..&sid=..&sni=..&fp=..`
-are parsed by `ParseLink`. Links that carry `flow=xtls-rprx-vision` are rejected because Vision is not implemented; use a server inbound
-without a flow. A wrong key, shortId or server name fails with a clear error instead of hanging. Test it against your own server before relying on it.
+are parsed by `ParseLink`. A wrong key, shortId or server name fails with a clear error instead of hanging. Test it against your own server before relying on it.
+
+## XTLS Vision
+Set `"flow": "xtls-rprx-vision"` on a `vless` config, or use a share link with `flow=xtls-rprx-vision` (`-udp443` is accepted too). It needs the plain
+`tcp` transport with `tls.enabled` or `reality`; `New` and `ParseLink` reject it with ws/h2/grpc/xhttp/quic, without TLS or REALITY, and with `mux`.
+The client pads the inner TLS handshake and follows the server's switch to direct copy. It is based on Xray-core's behaviour and has only been
+tested against its own framing, not a live server, so try it against your own inbound before relying on it. Other flows are rejected.
 
 ## TUN (Android)
 1. `go get gvisor.dev/gvisor@go && go mod tidy`
