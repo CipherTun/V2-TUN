@@ -1,9 +1,15 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
+	"fmt"
 	"net"
+	"strings"
 	"sync"
 	"time"
 
@@ -21,8 +27,47 @@ type SSH struct {
 	Password   string
 	PrivateKey []byte
 	Options    SSHOptions
-	mu         sync.Mutex
-	client     *ssh.Client
+	// HostKeySHA256 pins the server's host key: an OpenSSH fingerprint
+	// ("SHA256:...", as printed by ssh-keygen -l) or 64 hex characters. Empty
+	// accepts any key, which is what most tunnel apps do and lets anyone on the
+	// path impersonate the server.
+	HostKeySHA256 string
+	mu            sync.Mutex
+	client        *ssh.Client
+}
+
+// parsePin decodes a host key pin into the 32-byte SHA-256 of the key blob.
+func parsePin(p string) ([]byte, bool) {
+	p = strings.TrimSpace(p)
+	if rest, ok := strings.CutPrefix(p, "SHA256:"); ok {
+		b, err := base64.RawStdEncoding.DecodeString(strings.TrimRight(rest, "="))
+		return b, err == nil && len(b) == 32
+	}
+	b, err := hex.DecodeString(strings.ReplaceAll(p, ":", ""))
+	return b, err == nil && len(b) == 32
+}
+
+// ValidHostKeyPin reports whether p is a usable host key pin.
+func ValidHostKeyPin(p string) bool {
+	_, ok := parsePin(p)
+	return ok
+}
+
+func (s *SSH) hostKeyCallback() ssh.HostKeyCallback {
+	if s.HostKeySHA256 == "" {
+		return ssh.InsecureIgnoreHostKey()
+	}
+	want, ok := parsePin(s.HostKeySHA256)
+	return func(_ string, _ net.Addr, key ssh.PublicKey) error {
+		if !ok {
+			return errors.New("ssh: the pinned host key fingerprint is malformed")
+		}
+		sum := sha256.Sum256(key.Marshal())
+		if !bytes.Equal(sum[:], want) {
+			return fmt.Errorf("ssh: host key %s does not match the pinned fingerprint", ssh.FingerprintSHA256(key))
+		}
+		return nil
+	}
 }
 
 func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
@@ -37,7 +82,7 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 	}
 	cfg := &ssh.ClientConfig{
 		User:            s.User,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // matches typical tunnel apps; pin later
+		HostKeyCallback: s.hostKeyCallback(),
 		Timeout:         20 * time.Second,
 		Config: ssh.Config{
 			Ciphers:      pick(s.Options.Ciphers, sshCiphers),
