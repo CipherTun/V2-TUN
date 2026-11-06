@@ -83,6 +83,9 @@ func (t *Trojan) DialUDP(ctx context.Context, target string) (net.Conn, error) {
 }
 
 func (c *trojanUDPConn) Write(p []byte) (int, error) {
+	if len(p) > 65535 { // the length field is 16 bits
+		return 0, errors.New("udp: datagram too large")
+	}
 	pkt := append([]byte(nil), c.addr...)
 	pkt = binary.BigEndian.AppendUint16(pkt, uint16(len(p)))
 	pkt = append(pkt, '\r', '\n')
@@ -143,6 +146,9 @@ type ssUDPConn struct {
 	hdr  []byte
 }
 
+// DialUDP talks to the server's UDP port directly. That only works when the
+// connection chain is plain TCP (no TLS/WebSocket/...); v2tun.New hides this
+// method behind a TCP-only wrapper for every other chain.
 func (s *Shadowsocks) DialUDP(ctx context.Context, target string) (net.Conn, error) {
 	spec, ok := ssMethods[strings.ToLower(s.Method)]
 	if !ok {
@@ -152,7 +158,9 @@ func (s *Shadowsocks) DialUDP(ctx context.Context, target string) (net.Conn, err
 	if err != nil {
 		return nil, err
 	}
-	srv, err := net.ResolveUDPAddr("udp", s.Server)
+	// Resolve with the protected resolver: the system one would send the
+	// lookup into the VPN it is supposed to bypass.
+	srv, err := transport.ResolveUDPAddr(ctx, s.Server)
 	if err != nil {
 		return nil, err
 	}
