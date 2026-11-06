@@ -13,6 +13,8 @@ import (
 	"time"
 
 	v2tun "io.surprise.vpn"
+	"io.surprise.vpn/payload"
+	"io.surprise.vpn/route"
 	"io.surprise.vpn/socks"
 	"io.surprise.vpn/transport"
 	"io.surprise.vpn/tun"
@@ -34,17 +36,91 @@ var (
 	active  *v2tun.Client
 )
 
-// SetRouteList supplies a named list for "list:NAME" routing entries.
-// items: one domain/CIDR per line. Call after Start/StartTun/StartTunEx.
-func SetRouteList(name, items string) error {
+func running() (*v2tun.Client, error) {
 	mu.Lock()
 	c := active
 	mu.Unlock()
 	if c == nil {
-		return errors.New("v2tun: not running")
+		return nil, errors.New("v2tun: not running")
+	}
+	return c, nil
+}
+
+// SetRouteList supplies a named list for "list:NAME", "geoip:XX" and
+// "geosite:XX" routing entries. items: one domain/CIDR per line.
+// Call after Start/StartTun/StartTunEx.
+func SetRouteList(name, items string) error {
+	c, err := running()
+	if err != nil {
+		return err
 	}
 	return c.SetRouteList(name, strings.Split(items, "\n"))
 }
+
+// SetRouteLists supplies several lists at once, with one rebuild of the rules.
+// listsJSON: {"geoip:cn":["1.0.1.0/24", ...], "list:ads":["domain:x.com", ...]}
+func SetRouteLists(listsJSON string) error {
+	c, err := running()
+	if err != nil {
+		return err
+	}
+	var lists map[string][]string
+	if err := json.Unmarshal([]byte(listsJSON), &lists); err != nil {
+		return err
+	}
+	return c.SetRouteLists(lists)
+}
+
+// UpdateRouting swaps the routing section (rules, split tunneling, switches)
+// while connected. routingJSON is the same object as "routing" in the config.
+// The config the VPN started with must contain a "routing" section (may be {}).
+func UpdateRouting(routingJSON string) error {
+	c, err := running()
+	if err != nil {
+		return err
+	}
+	var cfg route.Config
+	if err := json.Unmarshal([]byte(routingJSON), &cfg); err != nil {
+		return err
+	}
+	return c.SetRouting(&cfg)
+}
+
+// ExplainRoute reports how a connection would be routed, as JSON:
+// {"action":"direct","rule":"builtin:lan-ip"}. network is "tcp" or "udp",
+// addr is "host:port", protocol (http, tls, bittorrent, ssh) may be empty.
+func ExplainRoute(network, addr, protocol string) (string, error) {
+	c, err := running()
+	if err != nil {
+		return "", err
+	}
+	ctx := context.Background()
+	if protocol != "" {
+		ctx = route.WithProtocol(ctx, protocol)
+	}
+	d, err := c.Explain(ctx, network, addr)
+	if err != nil {
+		return "", err
+	}
+	b, err := json.Marshal(map[string]string{"action": string(d.Action), "rule": d.Rule})
+	return string(b), err
+}
+
+// ValidatePayload reports whether a payload template compiles.
+func ValidatePayload(template string) error { return payload.Validate(template) }
+
+// PreviewPayload renders a template with the given server host and port and
+// returns it with visible \r\n and markers where it is split or paused.
+func PreviewPayload(template, host string, port int) (string, error) {
+	t, err := payload.Compile(template)
+	if err != nil {
+		return "", err
+	}
+	return t.Preview(payload.Context{Host: host, Port: port}), nil
+}
+
+// PayloadPresets lists the built-in payload presets, one per line.
+func PayloadPresets() string { return strings.Join(payload.PresetNames(), "\n") }
 
 // StartTun routes the TUN fd through the tunnel with default options.
 func StartTun(configJSON string, fd int, mtu int, dns string) error {
@@ -52,7 +128,7 @@ func StartTun(configJSON string, fd int, mtu int, dns string) error {
 }
 
 // StartTunEx adds fake-IP DNS (domain routing for DNS-based apps) and
-// SNI/Host sniffing. dns example: "1.1.1.1:53".
+// SNI/Host/protocol sniffing (needed for protocol rules). dns example: "1.1.1.1:53".
 func StartTunEx(configJSON string, fd int, mtu int, dns string, fakeDNS, sniff bool) error {
 	mu.Lock()
 	defer mu.Unlock()
@@ -128,6 +204,13 @@ func Probe(configJSON, target string) error {
 
 // Start runs a local SOCKS5 server (e.g. "127.0.0.1:10808") through the tunnel.
 func Start(configJSON, listenAddr string) error {
+	return StartEx(configJSON, listenAddr, "", "")
+}
+
+// StartEx is Start with optional SOCKS5 username/password (both empty = no
+// authentication). The server supports CONNECT and UDP ASSOCIATE. Without a
+// password every app on the device can use the listener.
+func StartEx(configJSON, listenAddr, username, password string) error {
 	mu.Lock()
 	defer mu.Unlock()
 	if cancel != nil {
@@ -148,7 +231,7 @@ func Start(configJSON, listenAddr string) error {
 	ctx, cf := context.WithCancel(context.Background())
 	cancel = cf
 	active = c
-	go socks.Serve(ctx, l, c)
+	go socks.ServeOpts(ctx, l, c, socks.Options{Username: username, Password: password, UDP: c})
 	return nil
 }
 
