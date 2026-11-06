@@ -3,7 +3,11 @@ package transport
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -33,6 +37,10 @@ func (d *TCP) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 
 // TLS wraps Inner with TLS. AllowInsecure skips verification (the thing Xray removed).
 // Fingerprint (chrome|firefox|safari|ios|android|edge|random) uses uTLS to mimic a browser.
+// PinSHA256 pins certificates: the handshake only succeeds when the SHA-256 of
+// at least one certificate (DER) the server sends matches. The pin is checked
+// in addition to normal verification, and also when AllowInsecure is set, so a
+// self-signed server can be trusted by pin alone.
 type TLS struct {
 	Inner         Dialer
 	ServerName    string // SNI; empty => host of addr
@@ -40,6 +48,7 @@ type TLS struct {
 	AllowInsecure bool
 	MinVersion    uint16
 	Fingerprint   string
+	PinSHA256     []string // hex, ":" separators allowed
 }
 
 var fingerprints = map[string]utls.ClientHelloID{
@@ -58,6 +67,29 @@ func KnownFingerprint(name string) bool {
 	return ok
 }
 
+// pinVerifier returns a VerifyPeerCertificate hook for the pins, or nil.
+func pinVerifier(pins []string) func([][]byte, [][]*x509.Certificate) error {
+	want := map[string]bool{}
+	for _, p := range pins {
+		p = strings.ToLower(strings.ReplaceAll(strings.TrimSpace(p), ":", ""))
+		if p != "" {
+			want[p] = true
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	return func(raw [][]byte, _ [][]*x509.Certificate) error {
+		for _, c := range raw {
+			sum := sha256.Sum256(c)
+			if want[hex.EncodeToString(sum[:])] {
+				return nil
+			}
+		}
+		return errors.New("tls: no certificate in the server's chain matches pinnedPeerCertSha256")
+	}
+}
+
 func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	c, err := d.Inner.DialContext(ctx, network, addr)
 	if err != nil {
@@ -68,9 +100,10 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 	if sni == "" {
 		sni = host
 	}
+	pin := pinVerifier(d.PinSHA256)
 	if id, ok := fingerprints[strings.ToLower(d.Fingerprint)]; ok {
 		uc := utls.UClient(c, &utls.Config{ServerName: sni, InsecureSkipVerify: d.AllowInsecure,
-			NextProtos: d.ALPN}, id)
+			NextProtos: d.ALPN, VerifyPeerCertificate: pin}, id)
 		if err := uc.BuildHandshakeState(); err != nil {
 			c.Close()
 			return nil, err
@@ -101,10 +134,11 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 		return uc, nil
 	}
 	tc := tls.Client(c, &tls.Config{
-		ServerName:         sni,
-		NextProtos:         d.ALPN,
-		InsecureSkipVerify: d.AllowInsecure,
-		MinVersion:         d.MinVersion,
+		ServerName:            sni,
+		NextProtos:            d.ALPN,
+		InsecureSkipVerify:    d.AllowInsecure,
+		MinVersion:            d.MinVersion,
+		VerifyPeerCertificate: pin,
 	})
 	if err := tc.HandshakeContext(ctx); err != nil {
 		c.Close()
