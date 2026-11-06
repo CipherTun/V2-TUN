@@ -98,14 +98,15 @@ func Start(o Options) (*Tun, error) {
 	})
 	s.SetTransportProtocolHandler(tcp.ProtocolNumber, tf.HandlePacket)
 
-	// gVisor's udp.NewForwarder takes a handler with no return value; the
-	// forwarder's own HandlePacket reports the packet as handled.
-	uf := udp.NewForwarder(s, func(r *udp.ForwarderRequest) {
+	// udp.ForwarderHandler is func(*ForwarderRequest) (handled bool): true means
+	// this handler took the packet; false lets the stack answer with ICMP port
+	// unreachable. Flows we cannot serve are dropped silently (true), not refused.
+	uf := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		id := r.ID()
 		var wq waiter.Queue
 		e, err := r.CreateEndpoint(&wq)
 		if err != nil {
-			return
+			return false
 		}
 		c := gonet.NewUDPConn(&wq, e)
 		dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
@@ -121,6 +122,7 @@ func Start(o Options) (*Tun, error) {
 		default:
 			c.Close() // no UDP support: drop
 		}
+		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, uf.HandlePacket)
 	return t, nil
