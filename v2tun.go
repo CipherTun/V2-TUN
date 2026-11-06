@@ -123,6 +123,7 @@ type Config struct {
 	Server       string            `json:"server"`
 	Port         int               `json:"port"`
 	UUID         string            `json:"uuid"`
+	Flow         string            `json:"flow,omitempty"` // vless only: "xtls-rprx-vision" (see checkFlow)
 	AlterID      int               `json:"alterId"`
 	Password     string            `json:"password"`
 	Username     string            `json:"username"`
@@ -158,15 +159,46 @@ type Client struct {
 
 var ErrBlocked = errors.New("v2tun: blocked by routing rule")
 
+// checkFlow validates the VLESS flow. The only supported flow is XTLS Vision
+// ("xtls-rprx-vision", or its "-udp443" variant, which behaves the same for
+// TCP): it runs on plain TCP with TLS or REALITY directly on top, so any other
+// transport, no TLS layer, or Mux.Cool cannot carry it. Rejecting these here
+// beats a connection that fails later with a server-side protocol error.
+func checkFlow(cfg *Config) error {
+	f := strings.ToLower(cfg.Flow)
+	if f == "" {
+		return nil
+	}
+	if f != "xtls-rprx-vision" && f != "xtls-rprx-vision-udp443" {
+		return fmt.Errorf("v2tun: flow %q is not supported (only xtls-rprx-vision)", cfg.Flow)
+	}
+	if !strings.EqualFold(cfg.Protocol, "vless") {
+		return errors.New("v2tun: flow is only valid for vless")
+	}
+	if n := strings.ToLower(cfg.Network); n != "" && n != "tcp" {
+		return fmt.Errorf("v2tun: flow xtls-rprx-vision needs the tcp transport, not %q", cfg.Network)
+	}
+	if !cfg.TLS.Enabled && cfg.Reality == nil {
+		return errors.New("v2tun: flow xtls-rprx-vision needs TLS or REALITY")
+	}
+	if cfg.Mux != nil && cfg.Mux.Enabled {
+		return errors.New("v2tun: flow xtls-rprx-vision cannot be combined with mux")
+	}
+	return nil
+}
+
 func New(cfg *Config) (*Client, error) {
 	if cfg.Server == "" || cfg.Port == 0 {
 		return nil, errors.New("v2tun: server and port required")
+	}
+	if err := checkFlow(cfg); err != nil {
+		return nil, err
 	}
 	to := time.Duration(cfg.TimeoutSec) * time.Second
 	if to == 0 {
 		to = 15 * time.Second
 	}
-	// chain: tcp -> [payload pre] -> tls|reality -> [payload post] -> ws/httpupgrade
+	// chain: tcp -> [payload pre] -> [record layer, Vision only] -> tls|reality -> [payload post] -> ws/httpupgrade
 	net_ := strings.ToLower(cfg.Network)
 	proto := strings.ToLower(cfg.Protocol)
 	isHysteria := proto == "hysteria" || proto == "hysteria1" || proto == "hy" || proto == "hysteria2" || proto == "hy2"
@@ -224,7 +256,7 @@ func New(cfg *Config) (*Client, error) {
 	case "trojan":
 		c.out, muxable = &proxy.Trojan{Server: srv, Dialer: d, Password: cfg.Password}, true
 	case "vless":
-		c.out, muxable = &proxy.VLESS{Server: srv, Dialer: d, UUID: cfg.UUID}, true
+		c.out, muxable = &proxy.VLESS{Server: srv, Dialer: d, UUID: cfg.UUID, Flow: strings.ToLower(cfg.Flow)}, true
 	case "vmess":
 		c.out, muxable = &proxy.VMess{Server: srv, Dialer: d, UUID: cfg.UUID, AlterID: cfg.AlterID, Security: cfg.Method}, true
 	case "shadowsocks", "ss":
@@ -521,7 +553,7 @@ func normalizeResponseMap(m map[string]int) (map[string]int, error) {
 	return out, nil
 }
 
-// baseChain builds tcp -> [payload pre] -> tls|reality -> [payload post] (or QUIC alone).
+// baseChain builds tcp -> [payload pre] -> [record layer, Vision only] -> tls|reality -> [payload post] (or QUIC alone).
 func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *net.Resolver) (transport.Dialer, error) {
 	if net_ == "quic" { // QUIC carries its own TLS; payload and TLS layers don't apply
 		return &transport.QUIC{ServerName: cfg.TLS.SNI, ALPN: cfg.TLS.ALPN, AllowInsecure: cfg.TLS.AllowInsecure, Resolver: res}, nil
@@ -562,6 +594,9 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 	if pd != nil && !post {
 		pd.Inner = d
 		d = pd
+	}
+	if cfg.Flow != "" { // Vision: the record layer must sit directly below TLS / REALITY
+		d = &transport.RecordDialer{Inner: d}
 	}
 	switch {
 	case cfg.Reality != nil:
