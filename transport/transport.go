@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -115,6 +116,12 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 
 // Payload sends an HTTP-Injector style payload right after connecting.
 // See package payload for the tag list.
+//
+// With ExpectResponse the HTTP replies to the payload's request lines are read
+// and dropped before the protocol starts. That is what a "websocket upgrade"
+// payload for SSH needs: the server answers "101 Switching Protocols" and
+// then speaks raw SSH (no WebSocket framing), so the reply must not reach the
+// SSH client.
 type Payload struct {
 	Inner          Dialer
 	Template       *payload.Template
@@ -123,8 +130,9 @@ type Payload struct {
 	UserAgent      string
 	SNI            string            // value for [sni]
 	Vars           map[string]string // values for [var=name]
-	ExpectResponse bool              // read and validate the HTTP reply before continuing
-	ExpectCodes    []int             // accepted status codes; empty => 101 and any 2xx
+	ExpectResponse bool              // read and validate the HTTP replies before continuing
+	ExpectCodes    []int             // accepted status codes; empty => 101 and any 2xx; 0 accepts any
+	Responses      int               // replies to read; 0 => one per HTTP request line in the payload (1 to 4)
 }
 
 func codeOK(code int, allowed []int) bool {
@@ -132,11 +140,48 @@ func codeOK(code int, allowed []int) bool {
 		return code == 101 || (code >= 200 && code < 300)
 	}
 	for _, a := range allowed {
-		if a == code {
+		if a == code || a == 0 {
 			return true
 		}
 	}
 	return false
+}
+
+var requestLine = regexp.MustCompile(`(?m)^[A-Za-z]+ \S+ HTTP/1\.[01]\r?$`)
+
+// countRequests counts the HTTP request lines in the rendered payload, so a
+// payload that holds two requests (CONNECT to a proxy, then an Upgrade
+// request through it) waits for both replies.
+func countRequests(segs []payload.Segment) int {
+	var all []byte
+	for _, s := range segs {
+		all = append(all, s.Data...)
+	}
+	n := len(requestLine.FindAll(all, -1))
+	if n < 1 {
+		n = 1
+	}
+	if n > 4 {
+		n = 4
+	}
+	return n
+}
+
+func (d *Payload) readReplies(c net.Conn, segs []payload.Segment) error {
+	n := d.Responses
+	if n <= 0 {
+		n = countRequests(segs)
+	}
+	for i := 0; i < n; i++ {
+		code, err := payload.ReadHTTPHeaders(c)
+		if err != nil {
+			return fmt.Errorf("payload: waiting for reply %d of %d: %w", i+1, n, err)
+		}
+		if !codeOK(code, d.ExpectCodes) {
+			return fmt.Errorf("payload: reply %d of %d has status %d", i+1, n, code)
+		}
+	}
+	return nil
 }
 
 func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -160,10 +205,18 @@ func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Co
 		return nil, err
 	}
 	if d.ExpectResponse {
-		code, err := payload.ReadHTTPHeaders(c)
-		if err != nil || !codeOK(code, d.ExpectCodes) {
+		// A server that never answers must not hang the dial: stop at ctx or
+		// after 30 seconds, whichever comes first.
+		stop := context.AfterFunc(ctx, func() { c.Close() })
+		limit := time.AfterFunc(30*time.Second, func() { c.Close() })
+		err := d.readReplies(c, segs)
+		limit.Stop()
+		if !stop() && err == nil {
+			err = ctx.Err()
+		}
+		if err != nil {
 			c.Close()
-			return nil, fmt.Errorf("payload: server replied %d: %v", code, err)
+			return nil, err
 		}
 	}
 	return c, nil
