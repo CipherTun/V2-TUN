@@ -37,21 +37,43 @@ type RealityConfig struct {
 	Fingerprint string `json:"fingerprint"` // empty => TLS.Fingerprint, then chrome
 }
 
+// HysteriaConfig holds the settings of the hysteria and hysteria2 protocols
+// that have no place elsewhere. The server password (hysteria2) or auth string
+// (hysteria) is Config.Password; the TLS name and "insecure" flag are
+// Config.TLS.SNI and Config.TLS.AllowInsecure (TLS.Enabled is not needed).
+type HysteriaConfig struct {
+	Obfs      string `json:"obfs,omitempty"`      // hysteria2: Salamander password; hysteria: xplus password
+	PinSHA256 string `json:"pinSha256,omitempty"` // hysteria2: hex SHA-256 of the server certificate (replaces CA verification)
+	ALPN      string `json:"alpn,omitempty"`      // hysteria: default "hysteria"
+	UpMbps    int    `json:"upMbps,omitempty"`    // hysteria: required by the server, default 10; unused by hysteria2
+	DownMbps  int    `json:"downMbps,omitempty"`  // hysteria: required, default 50 (the server sends at this rate); hysteria2: advertised receive rate, 0 lets the server decide
+}
+
 // PayloadConfig is the HTTP-Injector style payload sent right after the TCP
 // connect (or after TLS with Stage "post-tls"). See package payload for tags.
+//
+// "SSH over WebSocket" needs no TLS: protocol ssh, a payload such as
+// "@ssh-ws" (or your own GET ... Upgrade: websocket request) and, if you use
+// one, an HTTP proxy in Proxy. Whether TLS is used is up to the config.
 type PayloadConfig struct {
-	Template       string            `json:"template"` // a template or a preset such as "@connect"
-	Host           string            `json:"host"`     // value for [host]; empty => server host
-	Method         string            `json:"method"`
-	UserAgent      string            `json:"userAgent"`
-	Stage          string            `json:"stage"` // "pre-tls" (default) or "post-tls"
-	ExpectResponse bool              `json:"expectResponse"`
-	ExpectCodes    []int             `json:"expectCodes,omitempty"` // accepted status codes; empty => 101 and any 2xx
-	Vars           map[string]string `json:"vars,omitempty"`        // values for [var=name]
+	Template string `json:"template"` // a template or a preset such as "@connect" or "@ssh-ws"
+	Host     string `json:"host"`     // value for [host] (and [host_port]); empty => server host
+	Method   string `json:"method"`
+	UserAgent string `json:"userAgent"`
+	Stage    string `json:"stage"` // "pre-tls" (default) or "post-tls"
+	// ExpectResponse says whether the server's HTTP reply to the payload is read
+	// and dropped before the protocol starts. Unset means automatic: yes when a
+	// Proxy is set, or when the payload is an HTTP request on a plain tcp
+	// stream (the "101 Switching Protocols" of an SSH-WS server, a proxy's 200).
+	ExpectResponse *bool `json:"expectResponse,omitempty"`
+	// ExpectResponses is how many replies to read; 0 means one per HTTP request
+	// line in the payload (a CONNECT followed by an Upgrade request gives two).
+	ExpectResponses int               `json:"expectResponses,omitempty"`
+	ExpectCodes     []int             `json:"expectCodes,omitempty"` // accepted status codes; empty => 101 and any 2xx; 0 accepts any
+	Vars            map[string]string `json:"vars,omitempty"`        // values for [var=name]
 	// Proxy ("host:port") is HTTP-Injector's remote proxy mode: the TCP
 	// connection goes to this proxy, the payload names the real server in
-	// [host_port], and the proxy's reply is checked (expectResponse is implied).
-	// It needs the pre-tls stage.
+	// [host_port]. It needs the pre-tls stage.
 	Proxy string `json:"proxy,omitempty"`
 }
 
@@ -83,9 +105,11 @@ type Advanced struct {
 }
 
 type Config struct {
-	// Protocol: trojan|vless|vmess|shadowsocks|ssh|socks5|socks4|http|https
-	// ("socks" is socks5, "socks4a" is socks4; "https" is an http proxy that
-	// needs tls.enabled).
+	// Protocol: trojan|vless|vmess|shadowsocks|ssh|socks5|socks4|http|https|
+	// hysteria2|hysteria ("socks" is socks5, "socks4a" is socks4, "hy2" is
+	// hysteria2, "hy" is hysteria; "https" is an http proxy that needs
+	// tls.enabled). The hysteria protocols bring their own QUIC/TLS: payload,
+	// reality, fragment and the other transports do not apply to them.
 	Protocol     string            `json:"protocol"`
 	Network      string            `json:"network"` // tcp (default)|ws|httpupgrade|h2|grpc|quic|xhttp
 	GRPCService  string            `json:"grpcService"`
@@ -95,7 +119,6 @@ type Config struct {
 	Server       string            `json:"server"`
 	Port         int               `json:"port"`
 	UUID         string            `json:"uuid"`
-	Flow         string            `json:"flow,omitempty"` // vless only: "xtls-rprx-vision" (see checkFlow)
 	AlterID      int               `json:"alterId"`
 	Password     string            `json:"password"`
 	Username     string            `json:"username"`
@@ -104,6 +127,7 @@ type Config struct {
 	ProxyHeaders map[string]string `json:"proxyHeaders,omitempty"` // extra headers for the http/https proxy CONNECT
 	TLS          TLSConfig         `json:"tls"`
 	Reality      *RealityConfig    `json:"reality,omitempty"`
+	Hysteria     *HysteriaConfig   `json:"hysteria,omitempty"`
 	WS           WSConfig          `json:"ws"`
 	Payload      *PayloadConfig    `json:"payload,omitempty"`
 	Advanced     Advanced          `json:"advanced"`
@@ -130,47 +154,21 @@ type Client struct {
 
 var ErrBlocked = errors.New("v2tun: blocked by routing rule")
 
-// checkFlow validates the VLESS flow. The only supported flow is XTLS Vision
-// ("xtls-rprx-vision", or its "-udp443" variant, which behaves the same for
-// TCP): it runs on plain TCP with TLS or REALITY directly on top, so any other
-// transport, no TLS layer, or Mux.Cool cannot carry it. Rejecting these here
-// beats a connection that fails later with a server-side protocol error.
-func checkFlow(cfg *Config) error {
-	f := strings.ToLower(cfg.Flow)
-	if f == "" {
-		return nil
-	}
-	if f != "xtls-rprx-vision" && f != "xtls-rprx-vision-udp443" {
-		return fmt.Errorf("v2tun: flow %q is not supported (only xtls-rprx-vision)", cfg.Flow)
-	}
-	if !strings.EqualFold(cfg.Protocol, "vless") {
-		return errors.New("v2tun: flow is only valid for vless")
-	}
-	if n := strings.ToLower(cfg.Network); n != "" && n != "tcp" {
-		return fmt.Errorf("v2tun: flow xtls-rprx-vision needs the tcp transport, not %q", cfg.Network)
-	}
-	if !cfg.TLS.Enabled && cfg.Reality == nil {
-		return errors.New("v2tun: flow xtls-rprx-vision needs TLS or REALITY")
-	}
-	if cfg.Mux != nil && cfg.Mux.Enabled {
-		return errors.New("v2tun: flow xtls-rprx-vision cannot be combined with mux")
-	}
-	return nil
-}
-
 func New(cfg *Config) (*Client, error) {
 	if cfg.Server == "" || cfg.Port == 0 {
 		return nil, errors.New("v2tun: server and port required")
-	}
-	if err := checkFlow(cfg); err != nil {
-		return nil, err
 	}
 	to := time.Duration(cfg.TimeoutSec) * time.Second
 	if to == 0 {
 		to = 15 * time.Second
 	}
-	// chain: tcp -> [payload pre] -> [record layer, Vision only] -> tls|reality -> [payload post] -> ws/httpupgrade
+	// chain: tcp -> [payload pre] -> tls|reality -> [payload post] -> ws/httpupgrade
 	net_ := strings.ToLower(cfg.Network)
+	proto := strings.ToLower(cfg.Protocol)
+	isHysteria := proto == "hysteria" || proto == "hysteria1" || proto == "hy" || proto == "hysteria2" || proto == "hy2"
+	if isHysteria && (cfg.Payload != nil || cfg.Reality != nil || cfg.Fragment != nil || (net_ != "" && net_ != "tcp")) {
+		return nil, errors.New("v2tun: hysteria brings its own QUIC and TLS; payload, reality, fragment and transports do not apply")
+	}
 	if cfg.Reality != nil && net_ == "quic" {
 		return nil, errors.New("v2tun: reality cannot be combined with the quic transport")
 	}
@@ -217,13 +215,12 @@ func New(cfg *Config) (*Client, error) {
 	}
 
 	c := &Client{direct: &transport.TCP{Timeout: to, Resolver: res}, resolver: res}
-	proto := strings.ToLower(cfg.Protocol)
 	muxable := false
 	switch proto {
 	case "trojan":
 		c.out, muxable = &proxy.Trojan{Server: srv, Dialer: d, Password: cfg.Password}, true
 	case "vless":
-		c.out, muxable = &proxy.VLESS{Server: srv, Dialer: d, UUID: cfg.UUID, Flow: strings.ToLower(cfg.Flow)}, true
+		c.out, muxable = &proxy.VLESS{Server: srv, Dialer: d, UUID: cfg.UUID}, true
 	case "vmess":
 		c.out, muxable = &proxy.VMess{Server: srv, Dialer: d, UUID: cfg.UUID, AlterID: cfg.AlterID, Security: cfg.Method}, true
 	case "shadowsocks", "ss":
@@ -242,6 +239,20 @@ func New(cfg *Config) (*Client, error) {
 			return nil, errors.New("v2tun: an https proxy needs tls.enabled")
 		}
 		c.out = &proxy.HTTPProxy{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Headers: cfg.ProxyHeaders}
+	case "hysteria2", "hy2":
+		hc := cfg.Hysteria
+		if hc == nil {
+			hc = &HysteriaConfig{}
+		}
+		c.out = &proxy.Hysteria2{Server: srv, Password: cfg.Password, SNI: cfg.TLS.SNI, AllowInsecure: cfg.TLS.AllowInsecure,
+			PinSHA256: hc.PinSHA256, Obfs: hc.Obfs, DownMbps: hc.DownMbps, Resolver: res}
+	case "hysteria", "hysteria1", "hy":
+		hc := cfg.Hysteria
+		if hc == nil {
+			hc = &HysteriaConfig{}
+		}
+		c.out = &proxy.Hysteria1{Server: srv, Auth: cfg.Password, SNI: cfg.TLS.SNI, AllowInsecure: cfg.TLS.AllowInsecure,
+			ALPN: hc.ALPN, Obfs: hc.Obfs, UpMbps: hc.UpMbps, DownMbps: hc.DownMbps, Resolver: res}
 	default:
 		return nil, fmt.Errorf("v2tun: unknown protocol %q", cfg.Protocol)
 	}
@@ -277,8 +288,9 @@ func New(cfg *Config) (*Client, error) {
 }
 
 // Close releases long-lived resources: the SSH session, shared Mux.Cool
-// connections and the udpgw stream. A Client that is just dropped keeps
-// them (and their keepalive goroutines) alive after the VPN stops.
+// connections, Hysteria's QUIC connection and the udpgw stream. A Client that
+// is just dropped keeps them (and their keepalive goroutines) alive after the
+// VPN stops.
 func (c *Client) Close() error {
 	if cl, ok := c.out.(io.Closer); ok {
 		cl.Close()
@@ -460,6 +472,29 @@ func realityDialer(cfg *Config, inner transport.Dialer, alpn []string) (transpor
 	return &transport.Reality{Inner: inner, ServerName: sni, PublicKey: pk, ShortID: sid, Fingerprint: fp, ALPN: alpn}, nil
 }
 
+// payloadExpectsReply decides whether the HTTP reply to the payload is read
+// and dropped before the protocol starts. An explicit expectResponse wins.
+// Otherwise: always with a remote proxy, and on a plain tcp stream whenever the
+// payload looks like an HTTP request (a preset, or a request line), because
+// the server then answers with a status line before the protocol begins, as
+// an SSH-WS server does with "101 Switching Protocols". With another transport
+// (ws, h2, ...) the payload is front traffic and gets no automatic reply.
+func payloadExpectsReply(net_ string, p *PayloadConfig) bool {
+	if p.ExpectResponse != nil {
+		return *p.ExpectResponse
+	}
+	if p.Proxy != "" {
+		return true
+	}
+	if net_ != "" && net_ != "tcp" {
+		return false
+	}
+	t := strings.ToLower(p.Template)
+	return strings.HasPrefix(strings.TrimSpace(t), "@") || strings.Contains(t, "http/1.") ||
+		strings.Contains(t, "[protocol]") || strings.Contains(t, "[netdata]") ||
+		strings.Contains(t, "[raw]") || strings.Contains(t, "[real_raw]")
+}
+
 // baseChain builds tcp -> [payload pre] -> tls|reality -> [payload post] (or QUIC alone).
 func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *net.Resolver) (transport.Dialer, error) {
 	if net_ == "quic" { // QUIC carries its own TLS; payload and TLS layers don't apply
@@ -475,13 +510,13 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 	}
 	var pd *transport.Payload
 	if p := cfg.Payload; p != nil && p.Template != "" {
-		tpl, err := payload.Compile(p.Template)
+		tpl, err := payload.CompileCompat(p.Template)
 		if err != nil {
 			return nil, err
 		}
 		pd = &transport.Payload{Template: tpl, Host: p.Host, Method: p.Method,
 			UserAgent: p.UserAgent, SNI: psni, Vars: p.Vars,
-			ExpectResponse: p.ExpectResponse || p.Proxy != "", ExpectCodes: p.ExpectCodes}
+			ExpectResponse: payloadExpectsReply(net_, p), ExpectCodes: p.ExpectCodes, Responses: p.ExpectResponses}
 	}
 	post := pd != nil && cfg.Payload.Stage == "post-tls"
 	if pd != nil && cfg.Payload.Proxy != "" {
@@ -496,9 +531,6 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 	if pd != nil && !post {
 		pd.Inner = d
 		d = pd
-	}
-	if cfg.Flow != "" { // Vision: the record layer must sit directly below TLS / REALITY
-		d = &transport.RecordDialer{Inner: d}
 	}
 	switch {
 	case cfg.Reality != nil:

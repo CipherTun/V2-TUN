@@ -21,16 +21,16 @@ func b64(s string) ([]byte, error) {
 func truthy(s string) bool { s = strings.ToLower(s); return s == "1" || s == "true" }
 
 // ParseLink converts a share link (vless://, vmess://, trojan://, ss://,
-// ssh://, socks5://, socks4://, http://, https://) into a Config and the
-// display name.
+// ssh://, socks5://, socks4://, http://, https://, hysteria2://, hy2://,
+// hysteria://) into a Config and the display name.
 //
 // Features the library cannot honor are rejected with an error instead of
 // being dropped silently (which would only show up later as a connection that
-// never works): VLESS flows other than xtls-rprx-vision, Vision without TLS or
-// REALITY (or on a non-tcp transport), and Shadowsocks plugins.
-// REALITY links (security=reality with pbk, sid, sni, fp) are supported; the
-// spiderX crawl (spx) is ignored. http:// and https:// links describe an HTTP
-// proxy (https uses TLS to the proxy), socks:// links a SOCKS proxy.
+// never works): VLESS flow (xtls-rprx-vision), Shadowsocks plugins, Hysteria
+// port hopping, faketcp and wechat-video. REALITY links (security=reality with
+// pbk, sid, sni, fp) are supported; the spiderX crawl (spx) is ignored.
+// http:// and https:// links describe an HTTP proxy (https uses TLS to the
+// proxy), socks:// links a SOCKS proxy.
 func ParseLink(link string) (*Config, string, error) {
 	link = strings.TrimSpace(link)
 	scheme, rest, ok := strings.Cut(link, "://")
@@ -44,6 +44,8 @@ func ParseLink(link string) (*Config, string, error) {
 		return parseSS(rest)
 	case "vless", "trojan", "ssh", "socks", "socks5", "socks5h", "socks4", "socks4a", "http", "https":
 		return parseURLLink(strings.ToLower(scheme), link)
+	case "hysteria2", "hy2", "hysteria", "hy":
+		return parseHysteriaLink(strings.ToLower(scheme), link)
 	}
 	return nil, "", fmt.Errorf("link: unsupported scheme %q", scheme)
 }
@@ -135,10 +137,7 @@ func parseURLLink(scheme, link string) (*Config, string, error) {
 	q := u.Query()
 	if scheme == "vless" && q.Get("flow") != "" {
 		// A server that expects a flow rejects clients that do not speak it.
-		cfg.Flow = strings.ToLower(q.Get("flow"))
-		if f := cfg.Flow; f != "xtls-rprx-vision" && f != "xtls-rprx-vision-udp443" {
-			return nil, "", fmt.Errorf("link: vless flow %q is not supported", q.Get("flow"))
-		}
+		return nil, "", fmt.Errorf("link: vless flow %q is not supported", q.Get("flow"))
 	}
 	if scheme == "trojan" && strings.EqualFold(q.Get("security"), "none") {
 		cfg.TLS.Enabled = false
@@ -151,9 +150,6 @@ func parseURLLink(scheme, link string) (*Config, string, error) {
 		if (scheme == "trojan" || scheme == "https") && q.Get("security") == "" {
 			cfg.TLS.Enabled = keep
 		}
-	}
-	if err := checkFlow(cfg); err != nil {
-		return nil, "", fmt.Errorf("link: %w", err)
 	}
 	return cfg, u.Fragment, nil
 }
