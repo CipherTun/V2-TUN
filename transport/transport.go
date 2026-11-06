@@ -121,7 +121,8 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 // and dropped before the protocol starts. That is what a "websocket upgrade"
 // payload for SSH needs: the server answers "101 Switching Protocols" and
 // then speaks raw SSH (no WebSocket framing), so the reply must not reach the
-// SSH client.
+// SSH client. Only the status line and headers are read; a body, if a server
+// sends one, is not skipped.
 type Payload struct {
 	Inner          Dialer
 	Template       *payload.Template
@@ -133,6 +134,13 @@ type Payload struct {
 	ExpectResponse bool              // read and validate the HTTP replies before continuing
 	ExpectCodes    []int             // accepted status codes; empty => 101 and any 2xx; 0 accepts any
 	Responses      int               // replies to read; 0 => one per HTTP request line in the payload (1 to 4)
+
+	// ResponseMap is the "response changer": a status code the server sent
+	// ("301", or a whole class such as "3xx") is treated as the code it maps
+	// to before the accept check, so {"301": 200} makes a "301 Moved
+	// Permanently" count as "200 OK". Exact codes win over classes. Keys must
+	// be lower case.
+	ResponseMap map[string]int
 }
 
 func codeOK(code int, allowed []int) bool {
@@ -145,6 +153,20 @@ func codeOK(code int, allowed []int) bool {
 		}
 	}
 	return false
+}
+
+// mapCode applies ResponseMap to a status code sent by the server.
+func (d *Payload) mapCode(code int) int {
+	if len(d.ResponseMap) == 0 {
+		return code
+	}
+	if to, ok := d.ResponseMap[strconv.Itoa(code)]; ok {
+		return to
+	}
+	if to, ok := d.ResponseMap[strconv.Itoa(code/100)+"xx"]; ok {
+		return to
+	}
+	return code
 }
 
 var requestLine = regexp.MustCompile(`(?m)^[A-Za-z]+ \S+ HTTP/1\.[01]\r?$`)
@@ -173,12 +195,12 @@ func (d *Payload) readReplies(c net.Conn, segs []payload.Segment) error {
 		n = countRequests(segs)
 	}
 	for i := 0; i < n; i++ {
-		code, err := payload.ReadHTTPHeaders(c)
+		raw, err := payload.ReadHTTPHeaders(c)
 		if err != nil {
 			return fmt.Errorf("payload: waiting for reply %d of %d: %w", i+1, n, err)
 		}
-		if !codeOK(code, d.ExpectCodes) {
-			return fmt.Errorf("payload: reply %d of %d has status %d", i+1, n, code)
+		if !codeOK(d.mapCode(raw), d.ExpectCodes) {
+			return fmt.Errorf("payload: reply %d of %d has status %d", i+1, n, raw)
 		}
 	}
 	return nil
