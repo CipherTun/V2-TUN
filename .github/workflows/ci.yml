@@ -1,19 +1,32 @@
+
 name: ci
+
 on:
   push:
     branches: ["fix/**", main]
   pull_request:
+
+permissions:
+  contents: read
+
 jobs:
   test:
+    name: Go validation
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
-        with: {go-version: stable, cache: false}
-      - name: "Resolve dependencies (no -u, keep versions from go.mod)"
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Resolve dependencies
         run: |
           go get gvisor.dev/gvisor@go
           go mod tidy
+
       - name: Keep the resolved go.mod / go.sum
         uses: actions/upload-artifact@v4
         with:
@@ -22,6 +35,142 @@ jobs:
             go.mod
             go.sum
           if-no-files-found: error
-      - run: go build ./...
-      - run: go vet ./...
-      - run: go test -race -count=1 ./...
+
+      - name: Build Go packages
+        run: go build ./...
+
+      - name: Run Go vet
+        run: go vet ./...
+
+      - name: Run Go tests
+        run: go test -race -count=1 ./...
+
+  build-lib:
+    name: Build Android library
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      LIB_NAME: LibV2tun
+      JAVA_PKG: io.surprise
+      ANDROID_API: "21"
+      TARGETS: android/arm64,android/arm,android/amd64
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Use the go.mod / go.sum resolved by the test job
+        uses: actions/download-artifact@v4
+        with:
+          name: go-mod-files
+          path: .
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Locate the Android SDK and NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sdk="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          ndk="${ANDROID_NDK_LATEST_HOME:-${ANDROID_NDK_HOME:-}}"
+
+          if [[ -z "$ndk" || ! -d "$ndk" ]]; then
+            ndk="$(
+              find "$sdk/ndk" \
+                -mindepth 1 -maxdepth 1 \
+                -type d 2>/dev/null |
+              sort -V | tail -n 1
+            )"
+          fi
+
+          if [[ -z "$ndk" || ! -d "$ndk" ]]; then
+            echo "ERROR: Android NDK not found on this runner."
+            exit 1
+          fi
+
+          echo "ANDROID_HOME=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$sdk" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ndk" >> "$GITHUB_ENV"
+
+          echo "Using Android SDK: $sdk"
+          echo "Using Android NDK: $ndk"
+
+      - name: Install gomobile
+        run: |
+          go install golang.org/x/mobile/cmd/gomobile@latest
+          go install golang.org/x/mobile/cmd/gobind@latest
+
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Prepare the module for gomobile bind
+        run: |
+          go get golang.org/x/mobile@latest
+          go mod download
+          gomobile init
+
+      - name: Build ${{ env.LIB_NAME }}.aar
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          gomobile bind \
+            -target="$TARGETS" \
+            -androidapi="$ANDROID_API" \
+            -javapkg="$JAVA_PKG" \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o "dist/${LIB_NAME}.aar" \
+            io.surprise.vpn/mobile
+
+          test -s "dist/${LIB_NAME}.aar"
+
+          ls -lh dist/
+
+      - name: Check the AAR contents
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          aar="dist/${LIB_NAME}.aar"
+
+          unzip -tq "$aar"
+
+          echo "========== AAR CONTENTS =========="
+          unzip -Z1 "$aar"
+
+          echo "========== CHECK JAVA CLASSES =========="
+          unzip -Z1 "$aar" | grep -q '^classes.jar$'
+
+          echo "========== CHECK ANDROID ABIs =========="
+
+          for abi in armeabi-v7a arm64-v8a x86_64; do
+            if ! unzip -Z1 "$aar" |
+              grep -Eq "^jni/${abi}/[^/]+\.so$"; then
+              echo "ERROR: Missing native library for $abi"
+              exit 1
+            fi
+
+            echo "Verified: $abi"
+          done
+
+          echo "Android library validation successful."
+
+      - name: Upload Android library
+        uses: actions/upload-artifact@v4
+        with:
+          name: LibV2tun-Android
+          path: dist/LibV2tun.aar
+          if-no-files-found: error
+          compression-level: 0
