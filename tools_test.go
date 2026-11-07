@@ -24,20 +24,14 @@ func failoverDeadPort(t *testing.T) int {
 	return port
 }
 
-// Backups and Fallbacks are two spellings of one ordered failover list; the
-// tests run both, and together (Backups are tried first).
-func TestFallbackTakesOverAndSticks(t *testing.T) {
+func TestBackupsTakeOverAndStick(t *testing.T) {
 	cases := []struct {
 		name string
-		want int // ActiveOutbound once the live outbound answered
+		want int // ActiveOutbound once the live backup answered
 		set  func(cfg *Config, dead, live Config)
 	}{
-		{"backups", 1, func(cfg *Config, dead, live Config) { cfg.Backups = []Config{live} }},
-		{"fallbacks", 1, func(cfg *Config, dead, live Config) { cfg.Fallbacks = []*Config{&live} }},
-		{"both lists", 2, func(cfg *Config, dead, live Config) {
-			cfg.Backups = []Config{dead}
-			cfg.Fallbacks = []*Config{&live}
-		}},
+		{"first backup", 1, func(cfg *Config, dead, live Config) { cfg.Backups = []Config{live} }},
+		{"second backup after a dead one", 2, func(cfg *Config, dead, live Config) { cfg.Backups = []Config{dead, live} }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -62,42 +56,33 @@ func TestFallbackTakesOverAndSticks(t *testing.T) {
 	}
 }
 
-func TestFallbackValidation(t *testing.T) {
+func TestBackupsValidation(t *testing.T) {
 	sub := func(port int) Config { return Config{Protocol: "socks5", Server: "127.0.0.1", Port: port} }
 	bad := map[string]func(c *Config){
-		"fallbacks of fallbacks": func(c *Config) {
-			in := sub(2)
-			in.Fallbacks = []*Config{{Protocol: "socks5", Server: "127.0.0.1", Port: 3}}
-			c.Fallbacks = []*Config{&in}
-		},
 		"backups of backups": func(c *Config) {
 			in := sub(2)
 			in.Backups = []Config{sub(3)}
 			c.Backups = []Config{in}
-		},
-		"backups inside a fallback": func(c *Config) {
-			in := sub(2)
-			in.Backups = []Config{sub(3)}
-			c.Fallbacks = []*Config{&in}
-		},
-		"an invalid fallback": func(c *Config) {
-			c.Fallbacks = []*Config{{Protocol: "nonsense", Server: "127.0.0.1", Port: 2}}
 		},
 		"an invalid backup": func(c *Config) {
 			in := sub(2)
 			in.Protocol = "nonsense"
 			c.Backups = []Config{in}
 		},
-		"a null fallback": func(c *Config) { c.Fallbacks = []*Config{nil} },
 		"routing in a backup": func(c *Config) {
 			in := sub(2)
 			in.Routing = &route.Config{}
 			c.Backups = []Config{in}
 		},
-		"udpgw in a fallback": func(c *Config) {
+		"udpgw in a backup": func(c *Config) {
 			in := sub(2)
 			in.UDPGW = "127.0.0.1:7300"
-			c.Fallbacks = []*Config{&in}
+			c.Backups = []Config{in}
+		},
+		"directDns in a backup": func(c *Config) {
+			in := sub(2)
+			in.DirectDNS = "9.9.9.9:53"
+			c.Backups = []Config{in}
 		},
 	}
 	for name, mutate := range bad {
@@ -161,6 +146,14 @@ func TestPreviewPayload(t *testing.T) {
 	}
 	if !strings.Contains(out, "the proxy 1.2.3.4:8080") || !strings.Contains(out, "expects 2 HTTP reply") {
 		t.Errorf("proxy preview:\n%s", out)
+	}
+	out, err = PreviewPayload(&Config{Protocol: "ssh", Server: "origin.example", Port: 22,
+		Payload: &PayloadConfig{Template: "GET / HTTP/1.1[crlf][delay=300]Host: bug.example.com[crlf][crlf]"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "segment 2") || !strings.Contains(out, "then waits 300 ms") {
+		t.Errorf("a delay must show up in the preview:\n%s", out)
 	}
 	if _, err := PreviewPayload(&Config{Server: "x", Port: 1}); err == nil {
 		t.Fatal("no payload must be reported")
