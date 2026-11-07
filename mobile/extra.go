@@ -91,7 +91,7 @@ func ScanHosts(configJSON, field, values, target string, concurrency, seconds in
 }
 
 // ActiveOutbound says which config the running tunnel uses: 0 for the main
-// config, 1 for the first fallback and so on, -1 when nothing is running.
+// config, 1 for the first backup and so on, -1 when nothing is running.
 func ActiveOutbound() int {
 	mu.Lock()
 	c := active
