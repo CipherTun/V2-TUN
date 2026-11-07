@@ -1,0 +1,68 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="200" viewBox="0 0 900 200" role="img" aria-label="v2-tun roadmap: what ships next">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#070b1a"/>
+      <stop offset="0.6" stop-color="#12123a"/>
+      <stop offset="1" stop-color="#2a0f33"/>
+    </linearGradient>
+    <linearGradient id="title" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#f472b6">
+        <animate attributeName="stop-color" values="#f472b6;#a78bfa;#22d3ee;#f472b6" dur="8s" repeatCount="indefinite"/>
+      </stop>
+      <stop offset="1" stop-color="#22d3ee">
+        <animate attributeName="stop-color" values="#22d3ee;#f472b6;#a78bfa;#22d3ee" dur="8s" repeatCount="indefinite"/>
+      </stop>
+    </linearGradient>
+    <radialGradient id="orb">
+      <stop offset="0" stop-color="#a78bfa" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#a78bfa" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="glow" x="-20%" y="-50%" width="140%" height="200%">
+      <feGaussianBlur stdDeviation="5" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <pattern id="grid" width="30" height="30" patternUnits="userSpaceOnUse">
+      <path d="M30 0H0V30" fill="none" stroke="#ffffff" stroke-opacity="0.04"/>
+    </pattern>
+    <clipPath id="typed">
+      <rect x="40" y="96" height="40" width="0">
+        <animate attributeName="width" values="0;260;260;0" keyTimes="0;0.45;0.92;1" dur="6s" repeatCount="indefinite"/>
+      </rect>
+    </clipPath>
+  </defs>
+
+  <rect width="900" height="200" rx="18" fill="url(#bg)"/>
+  <rect width="900" height="200" rx="18" fill="url(#grid)"/>
+  <circle cx="700" cy="60" r="140" fill="url(#orb)">
+    <animate attributeName="cx" values="700;560;700" dur="10s" repeatCount="indefinite"/>
+  </circle>
+
+  <path d="M470 150C560 90 640 190 730 120S850 70 880 100" fill="none" stroke="#ffffff" stroke-opacity="0.25" stroke-width="3" stroke-dasharray="6 10">
+    <animate attributeName="stroke-dashoffset" from="0" to="-32" dur="1.4s" repeatCount="indefinite"/>
+  </path>
+  <circle r="8" fill="#22d3ee" filter="url(#glow)">
+    <animateMotion path="M470 150C560 90 640 190 730 120S850 70 880 100" dur="5s" repeatCount="indefinite"/>
+  </circle>
+
+  <text x="40" y="82" font-family="'JetBrains Mono','Fira Code','SF Mono','Cascadia Code',Consolas,'Courier New',monospace" font-size="62" font-weight="800" fill="url(#title)" filter="url(#glow)">Roadmap</text>
+
+  <g clip-path="url(#typed)">
+    <text x="40" y="126" font-family="'JetBrains Mono','Fira Code','SF Mono','Cascadia Code',Consolas,'Courier New',monospace" font-size="26" fill="#e2e8f0">what ships next</text>
+  </g>
+  <rect y="100" width="3" height="30" fill="#f472b6">
+    <animate attributeName="x" values="40;282;282;40" keyTimes="0;0.45;0.92;1" dur="6s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="1;0;1" dur="0.9s" repeatCount="indefinite"/>
+  </rect>
+
+  <g font-family="'Segoe UI','Inter','Helvetica Neue',Arial,sans-serif" font-size="14" font-weight="600" fill="#cbd5e1">
+    <circle cx="48" cy="168" r="6" fill="#34d399"/>
+    <text x="62" y="173">shipped</text>
+    <circle cx="150" cy="168" r="6" fill="#22d3ee">
+      <animate attributeName="r" values="6;8;6" dur="1.6s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0.5;1" dur="1.6s" repeatCount="indefinite"/>
+    </circle>
+    <text x="164" y="173">planned</text>
+    <circle cx="256" cy="168" r="6" fill="#a78bfa"/>
+    <text x="270" y="173">needs a live server</text>
+  </g>
+</svg>
