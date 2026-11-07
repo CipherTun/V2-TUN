@@ -73,7 +73,7 @@ type PayloadConfig struct {
 	// ResponseMap is the response changer: a status code the server sent ("301",
 	// or a class such as "3xx") counts as the code it maps to, so
 	// {"301": 200} makes "301 Moved Permanently" work like "200 OK".
-	ResponseMap map[string]int    `json:"responseMap,omitempty"`
+	ResponseMap map[string]int  `json:"responseMap,omitempty"`
 	Vars        map[string]string `json:"vars,omitempty"` // values for [var=name]
 	// Proxy ("host:port") is HTTP-Injector's remote proxy mode: the TCP
 	// connection goes to this proxy, the payload names the real server in
@@ -126,7 +126,6 @@ type Config struct {
 	Server       string            `json:"server"`
 	Port         int               `json:"port"`
 	UUID         string            `json:"uuid"`
-	Flow         string            `json:"flow,omitempty"` // vless only: "xtls-rprx-vision" (see checkFlow)
 	AlterID      int               `json:"alterId"`
 	Password     string            `json:"password"`
 	Username     string            `json:"username"`
@@ -144,16 +143,12 @@ type Config struct {
 	UDPGW        string            `json:"udpgw"`     // BadVPN udpgw address as seen from the server, e.g. "127.0.0.1:7300"
 	DirectDNS    string            `json:"directDns"` // resolver for hostnames, bypasses the VPN (default 1.1.1.1:53)
 	TimeoutSec   int               `json:"timeoutSec"`
-
-	// Backups are complete outbound configs (another server, bug host,
-	// payload or protocol) that are tried in order when this one fails; the
-	// one that worked last is tried first next time (see proxy.Failover).
-	// routing, udpgw and directDns belong to the top-level config only, and
-	// backups cannot nest.
-	Backups []Config `json:"backups,omitempty"`
-	// FailoverTimeoutSec limits each outbound's attempt when Backups is set
-	// (default 12 seconds).
-	FailoverTimeoutSec int `json:"failoverTimeoutSec,omitempty"`
+	// Fallbacks are complete alternative configs (another server, another bug
+	// host or payload, another protocol). When a connection through this config
+	// fails, they are tried in order; the one that worked last is tried first
+	// next time. Routing, udpgw and directDns of the main config apply to all
+	// of them; fallbacks cannot have fallbacks of their own.
+	Fallbacks []*Config `json:"fallbacks,omitempty"`
 }
 
 type MuxConfig struct {
@@ -172,81 +167,129 @@ type Client struct {
 
 var ErrBlocked = errors.New("v2tun: blocked by routing rule")
 
-// checkFlow validates the VLESS flow. The only supported flow is XTLS Vision
-// ("xtls-rprx-vision", or its "-udp443" variant, which behaves the same for
-// TCP): it runs on plain TCP with TLS or REALITY directly on top, so any other
-// transport, no TLS layer, or Mux.Cool cannot carry it. Rejecting these here
-// beats a connection that fails later with a server-side protocol error.
-func checkFlow(cfg *Config) error {
-	f := strings.ToLower(cfg.Flow)
-	if f == "" {
-		return nil
+func New(cfg *Config) (*Client, error) {
+	if cfg.Server == "" || cfg.Port == 0 {
+		return nil, errors.New("v2tun: server and port required")
 	}
-	if f != "xtls-rprx-vision" && f != "xtls-rprx-vision-udp443" {
-		return fmt.Errorf("v2tun: flow %q is not supported (only xtls-rprx-vision)", cfg.Flow)
+	to := time.Duration(cfg.TimeoutSec) * time.Second
+	if to == 0 {
+		to = 15 * time.Second
 	}
-	if !strings.EqualFold(cfg.Protocol, "vless") {
-		return errors.New("v2tun: flow is only valid for vless")
+	// chain: tcp -> [payload pre] -> tls|reality -> [payload post] -> ws/httpupgrade
+	net_ := strings.ToLower(cfg.Network)
+	proto := strings.ToLower(cfg.Protocol)
+	isHysteria := proto == "hysteria" || proto == "hysteria1" || proto == "hy" || proto == "hysteria2" || proto == "hy2"
+	if isHysteria && (cfg.Payload != nil || cfg.Reality != nil || cfg.Fragment != nil || (net_ != "" && net_ != "tcp")) {
+		return nil, errors.New("v2tun: hysteria brings its own QUIC and TLS; payload, reality, fragment and transports do not apply")
 	}
-	if n := strings.ToLower(cfg.Network); n != "" && n != "tcp" {
-		return fmt.Errorf("v2tun: flow xtls-rprx-vision needs the tcp transport, not %q", cfg.Network)
+	if cfg.Reality != nil && net_ == "quic" {
+		return nil, errors.New("v2tun: reality cannot be combined with the quic transport")
 	}
-	if !cfg.TLS.Enabled && cfg.Reality == nil {
-		return errors.New("v2tun: flow xtls-rprx-vision needs TLS or REALITY")
-	}
-	if cfg.Mux != nil && cfg.Mux.Enabled {
-		return errors.New("v2tun: flow xtls-rprx-vision cannot be combined with mux")
-	}
-	return nil
-}
-
-// checkFingerprints rejects an unknown uTLS fingerprint name. Without this the
-// TLS layer would quietly fall back to Go's own (very recognisable) ClientHello
-// and REALITY to chrome, so a typo would go unnoticed.
-func checkFingerprints(cfg *Config) error {
-	names := []string{cfg.TLS.Fingerprint}
-	if cfg.Reality != nil {
-		names = append(names, cfg.Reality.Fingerprint)
-	}
-	for _, fp := range names {
-		if fp != "" && !transport.KnownFingerprint(fp) {
-			return fmt.Errorf("v2tun: unknown tls fingerprint %q (use chrome, firefox, safari, ios, android, edge or random)", fp)
+	tlsOn := cfg.TLS.Enabled || cfg.Reality != nil
+	alpn := cfg.TLS.ALPN
+	if len(alpn) == 0 {
+		switch net_ {
+		case "h2", "grpc", "xhttp", "splithttp":
+			alpn = []string{"h2"}
+		case "ws", "websocket", "httpupgrade":
+			alpn = []string{"http/1.1"}
 		}
 	}
-	return nil
-}
-
-// New builds the tunnel client: the outbound described by cfg, then cfg.Backups
-// behind a proxy.Failover when there are any, plus routing and udpgw.
-func New(cfg *Config) (*Client, error) {
 	dns := cfg.DirectDNS
 	if dns == "" {
 		dns = "1.1.1.1:53"
 	}
 	res := transport.NewResolver(dns)
-	out, to, err := buildOutbound(cfg, res)
+	d, err := baseChain(cfg, net_, to, alpn, res)
 	if err != nil {
 		return nil, err
 	}
-	if len(cfg.Backups) > 0 {
-		outs := []proxy.Outbound{out}
-		for i := range cfg.Backups {
-			b := &cfg.Backups[i]
-			if len(b.Backups) > 0 {
-				return nil, fmt.Errorf("v2tun: backup %d has backups of its own; list every backup in the top-level backups", i+1)
-			}
-			if b.Routing != nil || b.UDPGW != "" || b.DirectDNS != "" {
-				return nil, fmt.Errorf("v2tun: backup %d sets routing, udpgw or directDns; those belong to the top-level config", i+1)
-			}
-			bo, _, err := buildOutbound(b, res)
-			if err != nil {
-				return nil, fmt.Errorf("v2tun: backup %d: %w", i+1, err)
-			}
-			outs = append(outs, bo)
+	srv := net.JoinHostPort(cfg.Server, fmt.Sprint(cfg.Port))
+	switch net_ {
+	case "", "tcp":
+	case "h2", "http":
+		d = &transport.H2{Inner: d, TLS: tlsOn, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers}
+	case "xhttp", "splithttp":
+		x := &transport.XHTTP{Inner: d, Server: srv, TLS: tlsOn, SNI: cfg.TLS.SNI, ALPN: alpn,
+			Host: cfg.WS.Host, Path: cfg.WS.Path, Mode: cfg.XHTTPMode, Headers: cfg.WS.Headers}
+		if o := cfg.XHTTP; o != nil {
+			x.XPaddingBytes, x.ScMaxEachPostBytes, x.ScMinPostsIntervalMs = o.XPaddingBytes, o.ScMaxEachPostBytes, o.ScMinPostsIntervalMs
 		}
-		out = &proxy.Failover{Outs: outs, PerTry: time.Duration(cfg.FailoverTimeoutSec) * time.Second}
+		d = x
+	case "grpc":
+		d = &transport.GRPC{Inner: d, TLS: tlsOn, Host: cfg.WS.Host, Service: cfg.GRPCService}
+	case "quic":
+	case "ws", "websocket":
+		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers}
+	case "httpupgrade":
+		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers, Upgrade: true}
+	default:
+		return nil, fmt.Errorf("v2tun: transport %q not implemented yet", cfg.Network)
 	}
-	c := &Client{out: out, direct: &transport.TCP{Timeout: to, Resolver: res}, resolver: res}
+
+	c := &Client{direct: &transport.TCP{Timeout: to, Resolver: res}, resolver: res}
+	muxable := false
+	switch proto {
+	case "trojan":
+		c.out, muxable = &proxy.Trojan{Server: srv, Dialer: d, Password: cfg.Password}, true
+	case "vless":
+		c.out, muxable = &proxy.VLESS{Server: srv, Dialer: d, UUID: cfg.UUID}, true
+	case "vmess":
+		c.out, muxable = &proxy.VMess{Server: srv, Dialer: d, UUID: cfg.UUID, AlterID: cfg.AlterID, Security: cfg.Method}, true
+	case "shadowsocks", "ss":
+		c.out, muxable = &proxy.Shadowsocks{Server: srv, Dialer: d, Method: cfg.Method, Password: cfg.Password}, true
+	case "ssh":
+		if p := cfg.Advanced.SSHHostKey; p != "" && !proxy.ValidHostKeyPin(p) {
+			return nil, errors.New("v2tun: advanced.sshHostKey must be an OpenSSH fingerprint (SHA256:...) or 64 hex characters")
+		}
+		c.out = &proxy.SSH{Server: srv, Dialer: d, User: cfg.Username,
+			Password: cfg.Password, PrivateKey: readKey(cfg.PrivateKey),
+			HostKeySHA256: cfg.Advanced.SSHHostKey,
+			Options: proxy.SSHOptions{Ciphers: cfg.Advanced.SSHCiphers, KeyExchanges: cfg.Advanced.SSHKeyExchanges,
+				MACs: cfg.Advanced.SSHMACs, HostKeyAlgos: cfg.Advanced.SSHHostKeys}}
+	case "socks", "socks5":
+		c.out = &proxy.SOCKS{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Version: 5}
+	case "socks4", "socks4a":
+		c.out = &proxy.SOCKS{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Version: 4}
+	case "http", "https":
+		if proto == "https" && !tlsOn {
+			return nil, errors.New("v2tun: an https proxy needs tls.enabled")
+		}
+		c.out = &proxy.HTTPProxy{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Headers: cfg.ProxyHeaders}
+	case "hysteria2", "hy2":
+		hc := cfg.Hysteria
+		if hc == nil {
+			hc = &HysteriaConfig{}
+		}
+		c.out = &proxy.Hysteria2{Server: srv, Password: cfg.Password, SNI: cfg.TLS.SNI, AllowInsecure: cfg.TLS.AllowInsecure,
+			PinSHA256: hc.PinSHA256, Obfs: hc.Obfs, DownMbps: hc.DownMbps, Resolver: res}
+	case "hysteria", "hysteria1", "hy":
+		hc := cfg.Hysteria
+		if hc == nil {
+			hc = &HysteriaConfig{}
+		}
+		c.out = &proxy.Hysteria1{Server: srv, Auth: cfg.Password, SNI: cfg.TLS.SNI, AllowInsecure: cfg.TLS.AllowInsecure,
+			ALPN: hc.ALPN, Obfs: hc.Obfs, UpMbps: hc.UpMbps, DownMbps: hc.DownMbps, Resolver: res}
+	default:
+		return nil, fmt.Errorf("v2tun: unknown protocol %q", cfg.Protocol)
+	}
+	if cfg.Mux != nil && cfg.Mux.Enabled && muxable {
+		c.out = &proxy.Mux{Base: c.out, Concurrency: cfg.Mux.Concurrency}
+	}
+	if len(cfg.Fallbacks) > 0 {
+		outs := []proxy.Outbound{c.out}
+		for i, fb := range cfg.Fallbacks {
+			if fb == nil || len(fb.Fallbacks) > 0 {
+				return nil, fmt.Errorf("v2tun: fallback %d is empty or has fallbacks of its own", i+1)
+			}
+			fc, err := New(fb)
+			if err != nil {
+				return nil, fmt.Errorf("v2tun: fallback %d: %w", i+1, err)
+			}
+			outs = append(outs, fc.out)
+		}
+		c.out = &proxy.Failover{Outs: outs}
+	}
 	if cfg.UDPGW != "" {
 		gwAddr, out := cfg.UDPGW, c.out
 		c.gw = &udpgw.Client{Dial: func(ctx context.Context) (net.Conn, error) {
@@ -275,120 +318,13 @@ func New(cfg *Config) (*Client, error) {
 	return c, nil
 }
 
-// buildOutbound turns one config into an outbound: the dial chain (transport
-// layers) with the protocol on top, wrapped in Mux.Cool when asked. It returns
-// the connect timeout it used.
-func buildOutbound(cfg *Config, res *net.Resolver) (proxy.Outbound, time.Duration, error) {
-	if cfg.Server == "" || cfg.Port == 0 {
-		return nil, 0, errors.New("v2tun: server and port required")
+// ActiveOutbound tells which config the client currently uses: 0 for the main
+// config, 1 for the first fallback, and so on.
+func (c *Client) ActiveOutbound() int {
+	if f, ok := c.out.(*proxy.Failover); ok {
+		return f.Current()
 	}
-	if err := checkFlow(cfg); err != nil {
-		return nil, 0, err
-	}
-	if err := checkFingerprints(cfg); err != nil {
-		return nil, 0, err
-	}
-	to := time.Duration(cfg.TimeoutSec) * time.Second
-	if to == 0 {
-		to = 15 * time.Second
-	}
-	// chain: tcp -> [payload pre] -> [record layer, Vision only] -> tls|reality -> [payload post] -> ws/httpupgrade
-	net_ := strings.ToLower(cfg.Network)
-	proto := strings.ToLower(cfg.Protocol)
-	isHysteria := proto == "hysteria" || proto == "hysteria1" || proto == "hy" || proto == "hysteria2" || proto == "hy2"
-	if isHysteria && (cfg.Payload != nil || cfg.Reality != nil || cfg.Fragment != nil || (net_ != "" && net_ != "tcp")) {
-		return nil, 0, errors.New("v2tun: hysteria brings its own QUIC and TLS; payload, reality, fragment and transports do not apply")
-	}
-	if cfg.Reality != nil && net_ == "quic" {
-		return nil, 0, errors.New("v2tun: reality cannot be combined with the quic transport")
-	}
-	tlsOn := cfg.TLS.Enabled || cfg.Reality != nil
-	alpn := cfg.TLS.ALPN
-	if len(alpn) == 0 {
-		switch net_ {
-		case "h2", "grpc", "xhttp", "splithttp":
-			alpn = []string{"h2"}
-		case "ws", "websocket", "httpupgrade":
-			alpn = []string{"http/1.1"}
-		}
-	}
-	d, err := baseChain(cfg, net_, to, alpn, res)
-	if err != nil {
-		return nil, 0, err
-	}
-	srv := net.JoinHostPort(cfg.Server, fmt.Sprint(cfg.Port))
-	switch net_ {
-	case "", "tcp":
-	case "h2", "http":
-		d = &transport.H2{Inner: d, TLS: tlsOn, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers}
-	case "xhttp", "splithttp":
-		x := &transport.XHTTP{Inner: d, Server: srv, TLS: tlsOn, SNI: cfg.TLS.SNI, ALPN: alpn,
-			Host: cfg.WS.Host, Path: cfg.WS.Path, Mode: cfg.XHTTPMode, Headers: cfg.WS.Headers}
-		if o := cfg.XHTTP; o != nil {
-			x.XPaddingBytes, x.ScMaxEachPostBytes, x.ScMinPostsIntervalMs = o.XPaddingBytes, o.ScMaxEachPostBytes, o.ScMinPostsIntervalMs
-		}
-		d = x
-	case "grpc":
-		d = &transport.GRPC{Inner: d, TLS: tlsOn, Host: cfg.WS.Host, Service: cfg.GRPCService}
-	case "quic":
-	case "ws", "websocket":
-		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers}
-	case "httpupgrade":
-		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers, Upgrade: true}
-	default:
-		return nil, 0, fmt.Errorf("v2tun: transport %q not implemented yet", cfg.Network)
-	}
-
-	var out proxy.Outbound
-	muxable := false
-	switch proto {
-	case "trojan":
-		out, muxable = &proxy.Trojan{Server: srv, Dialer: d, Password: cfg.Password}, true
-	case "vless":
-		out, muxable = &proxy.VLESS{Server: srv, Dialer: d, UUID: cfg.UUID, Flow: strings.ToLower(cfg.Flow)}, true
-	case "vmess":
-		out, muxable = &proxy.VMess{Server: srv, Dialer: d, UUID: cfg.UUID, AlterID: cfg.AlterID, Security: cfg.Method}, true
-	case "shadowsocks", "ss":
-		out, muxable = &proxy.Shadowsocks{Server: srv, Dialer: d, Method: cfg.Method, Password: cfg.Password}, true
-	case "ssh":
-		if pin := cfg.Advanced.SSHHostKey; pin != "" && !proxy.ValidHostKeyPin(pin) {
-			return nil, 0, errors.New(`v2tun: advanced.sshHostKey must be "SHA256:..." (as ssh-keygen -l prints it) or 64 hex characters`)
-		}
-		out = &proxy.SSH{Server: srv, Dialer: d, User: cfg.Username,
-			Password: cfg.Password, PrivateKey: readKey(cfg.PrivateKey),
-			HostKeySHA256: cfg.Advanced.SSHHostKey,
-			Options: proxy.SSHOptions{Ciphers: cfg.Advanced.SSHCiphers, KeyExchanges: cfg.Advanced.SSHKeyExchanges,
-				MACs: cfg.Advanced.SSHMACs, HostKeyAlgos: cfg.Advanced.SSHHostKeys}}
-	case "socks", "socks5":
-		out = &proxy.SOCKS{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Version: 5}
-	case "socks4", "socks4a":
-		out = &proxy.SOCKS{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Version: 4}
-	case "http", "https":
-		if proto == "https" && !tlsOn {
-			return nil, 0, errors.New("v2tun: an https proxy needs tls.enabled")
-		}
-		out = &proxy.HTTPProxy{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Headers: cfg.ProxyHeaders}
-	case "hysteria2", "hy2":
-		hc := cfg.Hysteria
-		if hc == nil {
-			hc = &HysteriaConfig{}
-		}
-		out = &proxy.Hysteria2{Server: srv, Password: cfg.Password, SNI: cfg.TLS.SNI, AllowInsecure: cfg.TLS.AllowInsecure,
-			PinSHA256: hc.PinSHA256, Obfs: hc.Obfs, DownMbps: hc.DownMbps, Resolver: res}
-	case "hysteria", "hysteria1", "hy":
-		hc := cfg.Hysteria
-		if hc == nil {
-			hc = &HysteriaConfig{}
-		}
-		out = &proxy.Hysteria1{Server: srv, Auth: cfg.Password, SNI: cfg.TLS.SNI, AllowInsecure: cfg.TLS.AllowInsecure,
-			ALPN: hc.ALPN, Obfs: hc.Obfs, UpMbps: hc.UpMbps, DownMbps: hc.DownMbps, Resolver: res}
-	default:
-		return nil, 0, fmt.Errorf("v2tun: unknown protocol %q", cfg.Protocol)
-	}
-	if cfg.Mux != nil && cfg.Mux.Enabled && muxable {
-		out = &proxy.Mux{Base: out, Concurrency: cfg.Mux.Concurrency}
-	}
-	return out, to, nil
+	return 0
 }
 
 // Close releases long-lived resources: the SSH session, shared Mux.Cool
@@ -458,8 +394,7 @@ func (c *Client) DialContext(ctx context.Context, network, addr string) (net.Con
 }
 
 // DialUDP returns a datagram conn (one Write/Read = one datagram) to addr.
-// Order: routing rule, native UDP of the protocol (for a Failover: of any of
-// its outbounds), then BadVPN udpgw.
+// Order: routing rule, native UDP of the protocol, then BadVPN udpgw.
 func (c *Client) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
 	act, err := c.decide(ctx, "udp", addr)
 	if err != nil {
@@ -472,8 +407,8 @@ func (c *Client) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
 	case act == route.Direct:
 		conn, err = c.directUDP(ctx, addr)
 	default:
-		if proxy.SupportsUDP(c.out) {
-			conn, err = c.out.(proxy.UDPOutbound).DialUDP(ctx, addr)
+		if u, ok := c.out.(proxy.UDPOutbound); ok && proxy.SupportsUDP(c.out) {
+			conn, err = u.DialUDP(ctx, addr)
 		} else if c.gw != nil {
 			// udpgw only takes IP targets, but the TUN layer hands over a
 			// domain when fake-IP DNS or sniffing recovered one: resolve it
@@ -622,7 +557,7 @@ func normalizeResponseMap(m map[string]int) (map[string]int, error) {
 	return out, nil
 }
 
-// baseChain builds tcp -> [payload pre] -> [record layer, Vision only] -> tls|reality -> [payload post] (or QUIC alone).
+// baseChain builds tcp -> [payload pre] -> tls|reality -> [payload post] (or QUIC alone).
 func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *net.Resolver) (transport.Dialer, error) {
 	if net_ == "quic" { // QUIC carries its own TLS; payload and TLS layers don't apply
 		return &transport.QUIC{ServerName: cfg.TLS.SNI, ALPN: cfg.TLS.ALPN, AllowInsecure: cfg.TLS.AllowInsecure, Resolver: res}, nil
@@ -663,9 +598,6 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 	if pd != nil && !post {
 		pd.Inner = d
 		d = pd
-	}
-	if cfg.Flow != "" { // Vision: the record layer must sit directly below TLS / REALITY
-		d = &transport.RecordDialer{Inner: d}
 	}
 	switch {
 	case cfg.Reality != nil:
