@@ -91,6 +91,9 @@ type WSConfig struct {
 	Host    string            `json:"host"`
 	Path    string            `json:"path"`
 	Headers map[string]string `json:"headers"`
+	// PingSec sends a WebSocket ping frame every N seconds (ws transport only,
+	// 0 = off) so carriers and CDNs do not drop an idle tunnel.
+	PingSec int `json:"pingSec,omitempty"`
 }
 
 // XHTTPOptions tunes the XHTTP client; zero values use Xray's defaults.
@@ -109,6 +112,21 @@ type Advanced struct {
 	// SSHHostKey pins the SSH server's host key: "SHA256:..." as printed by
 	// ssh-keygen -l, or 64 hex characters. Empty accepts any key.
 	SSHHostKey string `json:"sshHostKey,omitempty"`
+	// SSHNext turns the ssh protocol into a double hop. The top-level server,
+	// username, password, privateKey and sshHostKey then describe the first
+	// (jump) host, which is reached through the whole dial chain (payload, TLS,
+	// WebSocket, ...); SSHNext is the second host, reached from inside the jump
+	// session, and is where the traffic exits.
+	SSHNext *SSHHop `json:"sshNext,omitempty"`
+}
+
+// SSHHop is the second server of an SSH double hop (see Advanced.SSHNext).
+type SSHHop struct {
+	Server     string `json:"server"` // host:port as the jump host reaches it
+	Username   string `json:"username"`
+	Password   string `json:"password"`
+	PrivateKey string `json:"privateKey"`        // PEM text or a file path, like Config.PrivateKey
+	HostKey    string `json:"hostKey,omitempty"` // host key pin, like Advanced.SSHHostKey
 }
 
 type Config struct {
@@ -145,6 +163,10 @@ type Config struct {
 	DirectDNS    string            `json:"directDns"` // resolver for hostnames, bypasses the VPN (default 1.1.1.1:53)
 	TimeoutSec   int               `json:"timeoutSec"`
 
+	// IdleTimeoutSec closes a tunneled connection after this many seconds with
+	// no data in either direction (0 = never). Top-level config only.
+	IdleTimeoutSec int `json:"idleTimeoutSec,omitempty"`
+
 	// Backups are complete outbound configs (another server, bug host,
 	// payload or protocol) that are tried in order when this one fails; the
 	// one that worked last is tried first next time (see proxy.Failover).
@@ -154,6 +176,11 @@ type Config struct {
 	// FailoverTimeoutSec limits each outbound's attempt when Backups is set
 	// (default 12 seconds).
 	FailoverTimeoutSec int `json:"failoverTimeoutSec,omitempty"`
+	// LatencySortSec, with Backups, measures every N seconds how fast each
+	// server accepts a TCP connection and, after a failure, tries the quickest
+	// first (the one in use stays first until it fails). 0 keeps the listed
+	// order. Top-level config only.
+	LatencySortSec int `json:"latencySortSec,omitempty"`
 }
 
 type MuxConfig struct {
@@ -168,6 +195,7 @@ type Client struct {
 	resolver *net.Resolver
 	router   *route.Router
 	gw       *udpgw.Client
+	idle     time.Duration // idle timeout of tunneled connections, 0 = none
 }
 
 var ErrBlocked = errors.New("v2tun: blocked by routing rule")
@@ -246,7 +274,8 @@ func New(cfg *Config) (*Client, error) {
 		}
 		out = &proxy.Failover{Outs: outs, PerTry: time.Duration(cfg.FailoverTimeoutSec) * time.Second}
 	}
-	c := &Client{out: out, direct: &transport.TCP{Timeout: to, Resolver: res}, resolver: res}
+	c := &Client{out: out, direct: &transport.TCP{Timeout: to, Resolver: res}, resolver: res,
+		idle: time.Duration(cfg.IdleTimeoutSec) * time.Second}
 	if cfg.UDPGW != "" {
 		gwAddr, out := cfg.UDPGW, c.out
 		c.gw = &udpgw.Client{Dial: func(ctx context.Context) (net.Conn, error) {
@@ -271,6 +300,16 @@ func New(cfg *Config) (*Client, error) {
 			return ips, err
 		}
 		c.router = r
+	}
+	if fo, ok := c.out.(*proxy.Failover); ok && cfg.LatencySortSec > 0 {
+		addrs := []string{probeAddr(cfg)}
+		for i := range cfg.Backups {
+			addrs = append(addrs, probeAddr(&cfg.Backups[i]))
+		}
+		if err := fo.StartLatencyEngine(context.Background(), time.Duration(cfg.LatencySortSec)*time.Second, addrs, res); err != nil {
+			c.Close()
+			return nil, err
+		}
 	}
 	return c, nil
 }
@@ -332,7 +371,7 @@ func buildOutbound(cfg *Config, res *net.Resolver) (proxy.Outbound, time.Duratio
 		d = &transport.GRPC{Inner: d, TLS: tlsOn, Host: cfg.WS.Host, Service: cfg.GRPCService}
 	case "quic":
 	case "ws", "websocket":
-		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers}
+		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers, PingSec: cfg.WS.PingSec}
 	case "httpupgrade":
 		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers, Upgrade: true}
 	default:
@@ -354,11 +393,25 @@ func buildOutbound(cfg *Config, res *net.Resolver) (proxy.Outbound, time.Duratio
 		if pin := cfg.Advanced.SSHHostKey; pin != "" && !proxy.ValidHostKeyPin(pin) {
 			return nil, 0, errors.New(`v2tun: advanced.sshHostKey must be "SHA256:..." (as ssh-keygen -l prints it) or 64 hex characters`)
 		}
-		out = &proxy.SSH{Server: srv, Dialer: d, User: cfg.Username,
+		opts := proxy.SSHOptions{Ciphers: cfg.Advanced.SSHCiphers, KeyExchanges: cfg.Advanced.SSHKeyExchanges,
+			MACs: cfg.Advanced.SSHMACs, HostKeyAlgos: cfg.Advanced.SSHHostKeys}
+		first := &proxy.SSH{Server: srv, Dialer: d, User: cfg.Username,
 			Password: cfg.Password, PrivateKey: readKey(cfg.PrivateKey),
-			HostKeySHA256: cfg.Advanced.SSHHostKey,
-			Options: proxy.SSHOptions{Ciphers: cfg.Advanced.SSHCiphers, KeyExchanges: cfg.Advanced.SSHKeyExchanges,
-				MACs: cfg.Advanced.SSHMACs, HostKeyAlgos: cfg.Advanced.SSHHostKeys}}
+			HostKeySHA256: cfg.Advanced.SSHHostKey, Options: opts}
+		out = first
+		if n := cfg.Advanced.SSHNext; n != nil {
+			// double hop: the first SSH server is the jump host, the second
+			// is dialed from inside its session and is where traffic exits
+			if _, _, err := net.SplitHostPort(n.Server); err != nil {
+				return nil, 0, fmt.Errorf("v2tun: advanced.sshNext.server must be host:port: %v", err)
+			}
+			if n.HostKey != "" && !proxy.ValidHostKeyPin(n.HostKey) {
+				return nil, 0, errors.New(`v2tun: advanced.sshNext.hostKey must be "SHA256:..." (as ssh-keygen -l prints it) or 64 hex characters`)
+			}
+			out = proxy.NewDoubleHop(first, &proxy.SSH{Server: n.Server, User: n.Username,
+				Password: n.Password, PrivateKey: readKey(n.PrivateKey),
+				HostKeySHA256: n.HostKey, Options: opts})
+		}
 	case "socks", "socks5":
 		out = &proxy.SOCKS{Server: srv, Dialer: d, Username: cfg.Username, Password: cfg.Password, Version: 5}
 	case "socks4", "socks4a":
@@ -462,6 +515,9 @@ func (c *Client) DialContext(ctx context.Context, network, addr string) (net.Con
 	}
 	if err != nil {
 		return nil, err
+	}
+	if c.idle > 0 {
+		conn = transport.NewTimeoutConn(conn, c.idle)
 	}
 	return countConn{conn}, nil
 }
