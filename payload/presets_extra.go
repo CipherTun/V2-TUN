@@ -2,8 +2,9 @@ package payload
 
 // Extra presets from the HTTP-Injector style payload set. They are registered
 // next to the built-in ones in payload.go and never replace a built-in name,
-// so @ssh-ws, @get, @head and @post keep their meaning.
+// so @get, @head and @post keep their meaning.
 //
+//	@ssh-ws                    GET / with Upgrade: websocket, plain text (SSHWebSocket)
 //	@ssh-ws/tcp, @ssh-ws/udp   CONNECT host:port with an Upgrade: websocket header
 //	                           (the SSH-over-WebSocket variant that goes through a
 //	                           CONNECT-capable front; both names are the same payload)
@@ -11,6 +12,7 @@ package payload
 //	@head-proxy                HEAD http://host/
 //	@post-proxy                POST http://host/ with an empty body
 var extraPresets = map[string]string{
+	"@ssh-ws":     SSHWebSocket,
 	"@get-proxy":  "GET http://[host]/ [protocol][crlf]Host: [host][crlf]User-Agent: [ua][crlf]Connection: Keep-Alive[crlf][crlf]",
 	"@head-proxy": "HEAD http://[host]/ [protocol][crlf]Host: [host][crlf]User-Agent: [ua][crlf]Connection: Keep-Alive[crlf][crlf]",
 	"@post-proxy": "POST http://[host]/ [protocol][crlf]Host: [host][crlf]User-Agent: [ua][crlf]Content-Length: 0[crlf]Connection: Keep-Alive[crlf][crlf]",
