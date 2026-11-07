@@ -151,11 +151,8 @@ type Config struct {
 	// routing, udpgw and directDns belong to the top-level config only, and
 	// backups cannot nest.
 	Backups []Config `json:"backups,omitempty"`
-	// Fallbacks is the same list as Backups, written as pointers. Both may be
-	// set: Backups are tried first, then Fallbacks, with the same rules.
-	Fallbacks []*Config `json:"fallbacks,omitempty"`
-	// FailoverTimeoutSec limits each outbound's attempt when there are
-	// backups or fallbacks (default 12 seconds).
+	// FailoverTimeoutSec limits each outbound's attempt when Backups is set
+	// (default 12 seconds).
 	FailoverTimeoutSec int `json:"failoverTimeoutSec,omitempty"`
 }
 
@@ -220,8 +217,7 @@ func checkFingerprints(cfg *Config) error {
 }
 
 // New builds the tunnel client: the outbound described by cfg, then cfg.Backups
-// and cfg.Fallbacks behind a proxy.Failover when there are any, plus routing
-// and udpgw.
+// behind a proxy.Failover when there are any, plus routing and udpgw.
 func New(cfg *Config) (*Client, error) {
 	dns := cfg.DirectDNS
 	if dns == "" {
@@ -232,21 +228,11 @@ func New(cfg *Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Backups first, then Fallbacks: one ordered list with one set of rules.
-	var extra []*Config
-	for i := range cfg.Backups {
-		extra = append(extra, &cfg.Backups[i])
-	}
-	for i, fb := range cfg.Fallbacks {
-		if fb == nil {
-			return nil, fmt.Errorf("v2tun: fallback %d is empty", i+1)
-		}
-		extra = append(extra, fb)
-	}
-	if len(extra) > 0 {
+	if len(cfg.Backups) > 0 {
 		outs := []proxy.Outbound{out}
-		for i, b := range extra {
-			if len(b.Backups) > 0 || len(b.Fallbacks) > 0 {
+		for i := range cfg.Backups {
+			b := &cfg.Backups[i]
+			if len(b.Backups) > 0 {
 				return nil, fmt.Errorf("v2tun: backup %d has backups of its own; list every backup in the top-level backups", i+1)
 			}
 			if b.Routing != nil || b.UDPGW != "" || b.DirectDNS != "" {
