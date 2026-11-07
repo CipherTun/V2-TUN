@@ -23,6 +23,7 @@ type WebSocket struct {
 	Path    string
 	Headers map[string]string
 	Upgrade bool // true => httpupgrade (no framing after handshake)
+	PingSec int  // seconds between WebSocket ping frames (framed mode only); 0 = off
 }
 
 const wsGUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
@@ -80,7 +81,9 @@ func (d *WebSocket) DialContext(ctx context.Context, network, addr string) (net.
 			c.Close()
 			return nil, errors.New("websocket: bad accept key")
 		}
-		return &wsConn{Conn: c, br: br}, nil
+		wc := &wsConn{Conn: c, br: br}
+		wc.startPingSec(d.PingSec)
+		return wc, nil
 	}
 	return &bufConn{Conn: c, br: br}, nil
 }
