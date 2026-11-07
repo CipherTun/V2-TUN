@@ -142,9 +142,9 @@ func acceptedText(codes []int, rm map[string]int) string {
 	return s
 }
 
-// PreviewPayload shows what the payload of cfg would send, segment by segment,
-// where it would go, and whether and how its HTTP replies are checked. Nothing
-// is sent.
+// PreviewPayload shows what the payload of cfg would send, segment by segment
+// (with the pause after each one), where it would go, and whether and how its
+// HTTP replies are checked. Nothing is sent.
 func PreviewPayload(cfg *Config) (string, error) {
 	p := cfg.Payload
 	if p == nil || p.Template == "" {
@@ -184,6 +184,9 @@ func PreviewPayload(cfg *Config) (string, error) {
 	var all []byte
 	for i, s := range segs {
 		fmt.Fprintf(&b, "segment %d (%d bytes): %s\n", i+1, len(s.Data), strconv.Quote(string(s.Data)))
+		if s.Delay > 0 {
+			fmt.Fprintf(&b, "  then waits %d ms\n", s.Delay/time.Millisecond)
+		}
 		all = append(all, s.Data...)
 	}
 	if payloadExpectsReply(strings.ToLower(cfg.Network), p) {
