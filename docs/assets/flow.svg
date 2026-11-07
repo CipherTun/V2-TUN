@@ -1,0 +1,78 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="190" viewBox="0 0 900 190" role="img" aria-label="Connection chain: tcp, payload pre-tls, tls or reality, payload post-tls, transport, protocol">
+  <defs>
+    <linearGradient id="n1" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#0ea5e9"/><stop offset="1" stop-color="#2563eb"/></linearGradient>
+    <linearGradient id="n2" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f59e0b"/><stop offset="1" stop-color="#ef4444"/></linearGradient>
+    <linearGradient id="n3" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#22c55e"/><stop offset="1" stop-color="#14b8a6"/></linearGradient>
+    <linearGradient id="n5" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#8b5cf6"/><stop offset="1" stop-color="#6366f1"/></linearGradient>
+    <linearGradient id="n6" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#ec4899"/><stop offset="1" stop-color="#f43f5e"/></linearGradient>
+    <filter id="glow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="3" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+  </defs>
+
+  <rect x="0.5" y="0.5" width="899" height="189" rx="16" fill="#0b1020" stroke="#1e293b"/>
+  <text x="24" y="34" font-family="'JetBrains Mono','Fira Code',Consolas,'Courier New',monospace" font-size="13" letter-spacing="3" fill="#94a3b8">CONNECTION CHAIN</text>
+
+  <g stroke="#94a3b8" stroke-width="2" stroke-dasharray="4 4" fill="none">
+    <path d="M135 97H157"><animate attributeName="stroke-dashoffset" from="0" to="-16" dur="0.8s" repeatCount="indefinite"/></path>
+    <path d="M285 97H307"><animate attributeName="stroke-dashoffset" from="0" to="-16" dur="0.8s" repeatCount="indefinite"/></path>
+    <path d="M435 97H457"><animate attributeName="stroke-dashoffset" from="0" to="-16" dur="0.8s" repeatCount="indefinite"/></path>
+    <path d="M585 97H607"><animate attributeName="stroke-dashoffset" from="0" to="-16" dur="0.8s" repeatCount="indefinite"/></path>
+    <path d="M735 97H757"><animate attributeName="stroke-dashoffset" from="0" to="-16" dur="0.8s" repeatCount="indefinite"/></path>
+  </g>
+  <g fill="#94a3b8">
+    <polygon points="165,97 157,92 157,102"/>
+    <polygon points="315,97 307,92 307,102"/>
+    <polygon points="465,97 457,92 457,102"/>
+    <polygon points="615,97 607,92 607,102"/>
+    <polygon points="765,97 757,92 757,102"/>
+  </g>
+
+  <g font-family="'Segoe UI','Inter','Helvetica Neue',Arial,sans-serif" font-size="14" font-weight="700" fill="#ffffff" text-anchor="middle">
+    <g>
+      <rect x="15" y="70" width="120" height="54" rx="12" fill="url(#n1)" stroke="#ffffff" stroke-opacity="0.15">
+        <animate attributeName="stroke-opacity" values="0.15;0.7;0.15" dur="3s" begin="0s" repeatCount="indefinite"/>
+      </rect>
+      <text x="75" y="102">TCP</text>
+    </g>
+    <g>
+      <rect x="165" y="70" width="120" height="54" rx="12" fill="url(#n2)" stroke="#ffffff" stroke-opacity="0.15">
+        <animate attributeName="stroke-opacity" values="0.15;0.7;0.15" dur="3s" begin="0.5s" repeatCount="indefinite"/>
+      </rect>
+      <text x="225" y="92">payload</text><text x="225" y="110" font-size="12" font-weight="500">pre-tls</text>
+    </g>
+    <g>
+      <rect x="315" y="70" width="120" height="54" rx="12" fill="url(#n3)" stroke="#ffffff" stroke-opacity="0.15">
+        <animate attributeName="stroke-opacity" values="0.15;0.7;0.15" dur="3s" begin="1s" repeatCount="indefinite"/>
+      </rect>
+      <text x="375" y="92">TLS or</text><text x="375" y="110">REALITY</text>
+    </g>
+    <g>
+      <rect x="465" y="70" width="120" height="54" rx="12" fill="url(#n2)" stroke="#ffffff" stroke-opacity="0.15">
+        <animate attributeName="stroke-opacity" values="0.15;0.7;0.15" dur="3s" begin="1.5s" repeatCount="indefinite"/>
+      </rect>
+      <text x="525" y="92">payload</text><text x="525" y="110" font-size="12" font-weight="500">post-tls</text>
+    </g>
+    <g>
+      <rect x="615" y="70" width="120" height="54" rx="12" fill="url(#n5)" stroke="#ffffff" stroke-opacity="0.15">
+        <animate attributeName="stroke-opacity" values="0.15;0.7;0.15" dur="3s" begin="2s" repeatCount="indefinite"/>
+      </rect>
+      <text x="675" y="92" font-size="13">WS • H2</text><text x="675" y="110" font-size="13">gRPC • XHTTP</text>
+    </g>
+    <g>
+      <rect x="765" y="70" width="120" height="54" rx="12" fill="url(#n6)" stroke="#ffffff" stroke-opacity="0.15">
+        <animate attributeName="stroke-opacity" values="0.15;0.7;0.15" dur="3s" begin="2.5s" repeatCount="indefinite"/>
+      </rect>
+      <text x="825" y="102">protocol</text>
+    </g>
+  </g>
+
+  <g fill="#ffffff" filter="url(#glow)">
+    <circle r="5"><animateMotion path="M15 97H885" dur="6s" begin="0s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.95;1" dur="6s" begin="0s" repeatCount="indefinite"/></circle>
+    <circle r="5"><animateMotion path="M15 97H885" dur="6s" begin="2s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.95;1" dur="6s" begin="2s" repeatCount="indefinite"/></circle>
+    <circle r="5"><animateMotion path="M15 97H885" dur="6s" begin="4s" repeatCount="indefinite"/><animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.95;1" dur="6s" begin="4s" repeatCount="indefinite"/></circle>
+  </g>
+
+  <text x="450" y="160" text-anchor="middle" font-family="'Segoe UI','Inter','Helvetica Neue',Arial,sans-serif" font-size="12" fill="#64748b">unset layers are skipped • hysteria brings its own QUIC and TLS</text>
+</svg>
