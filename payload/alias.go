@@ -19,9 +19,11 @@ var (
 
 // CompileCompat is Compile plus a few HTTP Injector spellings: [ssh] is
 // [host_port], [real_raw] is [raw], [b64=random16] is [ws_key] (base64 of 16
-// random bytes, a Sec-WebSocket-Key), and the preset "@ssh-ws" is SSHWebSocket.
+// random bytes, a Sec-WebSocket-Key), and the presets "@ssh-ws" and
+// "@ssh-ws/tcp" are SSHWebSocket.
 func CompileCompat(tpl string) (*Template, error) {
-	if strings.EqualFold(strings.TrimSpace(tpl), "@ssh-ws") {
+	switch strings.ToLower(strings.TrimSpace(tpl)) {
+	case "@ssh-ws", "@ssh-ws/tcp":
 		tpl = SSHWebSocket
 	}
 	tpl = aliasSSH.ReplaceAllString(tpl, "[host_port]")
