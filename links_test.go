@@ -202,7 +202,8 @@ func TestSSHDefaultPort(t *testing.T) {
 }
 
 func TestUnsupportedScheme(t *testing.T) {
-	if _, _, err := ParseLink("hysteria2://x@example.com:443"); err == nil {
+	// hysteria2:// and hy2:// are supported since the Hysteria wiring; use a scheme that really is not.
+	if _, _, err := ParseLink("wireguard://x@example.com:443"); err == nil {
 		t.Fatal("expected an error")
 	}
 }
