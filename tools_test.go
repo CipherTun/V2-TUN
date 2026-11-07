@@ -2,11 +2,6 @@ package v2tun
 
 import (
 	"context"
-	"crypto/ed25519"
-	"crypto/rand"
-	"encoding/base64"
-	"errors"
-	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -14,59 +9,106 @@ import (
 	"testing"
 	"time"
 
-	"golang.org/x/crypto/ssh"
-
 	"io.surprise.vpn/route"
 )
 
-func TestFallbackTakesOverAndSticks(t *testing.T) {
-	// a port nobody listens on
-	dead, err := net.Listen("tcp", "127.0.0.1:0")
+// failoverDeadPort returns a TCP port nobody listens on.
+func failoverDeadPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, dp, _ := net.SplitHostPort(dead.Addr().String())
-	dead.Close()
-	deadPort := 0
-	for _, c := range dp {
-		deadPort = deadPort*10 + int(c-'0')
-	}
+	port := l.Addr().(*net.TCPAddr).Port
+	l.Close()
+	return port
+}
 
-	h, p := pxServeOnce(t, func(c net.Conn) { pxSocks5(c, "", "") })
-	cl, err := New(&Config{
-		Protocol: "socks5", Server: "127.0.0.1", Port: deadPort,
-		Fallbacks: []*Config{{Protocol: "socks5", Server: h, Port: p}},
-	})
-	if err != nil {
-		t.Fatal(err)
+// Backups and Fallbacks are two spellings of one ordered failover list; the
+// tests run both, and together (Backups are tried first).
+func TestFallbackTakesOverAndSticks(t *testing.T) {
+	cases := []struct {
+		name string
+		want int // ActiveOutbound once the live outbound answered
+		set  func(cfg *Config, dead, live Config)
+	}{
+		{"backups", 1, func(cfg *Config, dead, live Config) { cfg.Backups = []Config{live} }},
+		{"fallbacks", 1, func(cfg *Config, dead, live Config) { cfg.Fallbacks = []*Config{&live} }},
+		{"both lists", 2, func(cfg *Config, dead, live Config) {
+			cfg.Backups = []Config{dead}
+			cfg.Fallbacks = []*Config{&live}
+		}},
 	}
-	defer cl.Close()
-	if cl.ActiveOutbound() != 0 {
-		t.Fatalf("active before any connection: %d", cl.ActiveOutbound())
-	}
-	pxEcho(t, cl, "target.example:80")
-	if cl.ActiveOutbound() != 1 {
-		t.Fatalf("the fallback should be active, got %d", cl.ActiveOutbound())
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, p := pxServeOnce(t, func(c net.Conn) { pxSocks5(c, "", "") })
+			live := Config{Protocol: "socks5", Server: h, Port: p}
+			dead := Config{Protocol: "socks5", Server: "127.0.0.1", Port: failoverDeadPort(t)}
+			cfg := &Config{Protocol: "socks5", Server: "127.0.0.1", Port: failoverDeadPort(t)}
+			tc.set(cfg, dead, live)
+			cl, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer cl.Close()
+			if cl.ActiveOutbound() != 0 {
+				t.Fatalf("active before any connection: %d", cl.ActiveOutbound())
+			}
+			pxEcho(t, cl, "target.example:80")
+			if got := cl.ActiveOutbound(); got != tc.want {
+				t.Fatalf("active outbound %d, want %d", got, tc.want)
+			}
+		})
 	}
 }
 
 func TestFallbackValidation(t *testing.T) {
-	base := func() *Config { return &Config{Protocol: "socks5", Server: "127.0.0.1", Port: 1} }
-	nested := base()
-	nested.Fallbacks = []*Config{{Protocol: "socks5", Server: "127.0.0.1", Port: 2,
-		Fallbacks: []*Config{{Protocol: "socks5", Server: "127.0.0.1", Port: 3}}}}
-	if _, err := New(nested); err == nil {
-		t.Fatal("fallbacks of fallbacks must be rejected")
+	sub := func(port int) Config { return Config{Protocol: "socks5", Server: "127.0.0.1", Port: port} }
+	bad := map[string]func(c *Config){
+		"fallbacks of fallbacks": func(c *Config) {
+			in := sub(2)
+			in.Fallbacks = []*Config{{Protocol: "socks5", Server: "127.0.0.1", Port: 3}}
+			c.Fallbacks = []*Config{&in}
+		},
+		"backups of backups": func(c *Config) {
+			in := sub(2)
+			in.Backups = []Config{sub(3)}
+			c.Backups = []Config{in}
+		},
+		"backups inside a fallback": func(c *Config) {
+			in := sub(2)
+			in.Backups = []Config{sub(3)}
+			c.Fallbacks = []*Config{&in}
+		},
+		"an invalid fallback": func(c *Config) {
+			c.Fallbacks = []*Config{{Protocol: "nonsense", Server: "127.0.0.1", Port: 2}}
+		},
+		"an invalid backup": func(c *Config) {
+			in := sub(2)
+			in.Protocol = "nonsense"
+			c.Backups = []Config{in}
+		},
+		"a null fallback": func(c *Config) { c.Fallbacks = []*Config{nil} },
+		"routing in a backup": func(c *Config) {
+			in := sub(2)
+			in.Routing = &route.Config{}
+			c.Backups = []Config{in}
+		},
+		"udpgw in a fallback": func(c *Config) {
+			in := sub(2)
+			in.UDPGW = "127.0.0.1:7300"
+			c.Fallbacks = []*Config{&in}
+		},
 	}
-	broken := base()
-	broken.Fallbacks = []*Config{{Protocol: "nonsense", Server: "127.0.0.1", Port: 2}}
-	if _, err := New(broken); err == nil {
-		t.Fatal("an invalid fallback must be reported")
-	}
-	nilFallback := base()
-	nilFallback.Fallbacks = []*Config{nil}
-	if _, err := New(nilFallback); err == nil {
-		t.Fatal("a null fallback must be rejected")
+	for name, mutate := range bad {
+		t.Run(name, func(t *testing.T) {
+			cfg := &Config{Protocol: "socks5", Server: "127.0.0.1", Port: 1}
+			mutate(cfg)
+			if cl, err := New(cfg); err == nil {
+				cl.Close()
+				t.Fatal("New must reject this config")
+			}
+		})
 	}
 }
 
@@ -146,68 +188,4 @@ func TestSpeedTest(t *testing.T) {
 	}
 }
 
-func pxSSHServeWith(c net.Conn, signer ssh.Signer) {
-	cfg := &ssh.ServerConfig{PasswordCallback: func(m ssh.ConnMetadata, pw []byte) (*ssh.Permissions, error) {
-		if m.User() == "u" && string(pw) == "p" {
-			return nil, nil
-		}
-		return nil, errors.New("denied")
-	}}
-	cfg.AddHostKey(signer)
-	conn, chans, reqs, err := ssh.NewServerConn(c, cfg)
-	if err != nil {
-		return
-	}
-	defer conn.Close()
-	go ssh.DiscardRequests(reqs)
-	for nc := range chans {
-		if nc.ChannelType() != "direct-tcpip" {
-			nc.Reject(ssh.UnknownChannelType, "not supported")
-			continue
-		}
-		ch, creqs, err := nc.Accept()
-		if err != nil {
-			continue
-		}
-		go ssh.DiscardRequests(creqs)
-		go func() {
-			io.Copy(ch, ch)
-			ch.Close()
-		}()
-	}
-}
-
-func TestSSHHostKeyPin(t *testing.T) {
-	_, priv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	signer, err := ssh.NewSignerFromSigner(priv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	client := func(pin string) *Client {
-		h, p := pxServeOnce(t, func(c net.Conn) { pxSSHServeWith(c, signer) })
-		cl, err := New(&Config{Protocol: "ssh", Server: h, Port: p, Username: "u", Password: "p",
-			Advanced: Advanced{SSHHostKey: pin}})
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Cleanup(func() { cl.Close() })
-		return cl
-	}
-
-	pxEcho(t, client(ssh.FingerprintSHA256(signer.PublicKey())), "target.example:80")
-
-	wrong := "SHA256:" + base64.RawStdEncoding.EncodeToString(make([]byte, 32))
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := client(wrong).DialContext(ctx, "tcp", "target.example:80"); err == nil {
-		t.Fatal("a server whose host key does not match the pin must be refused")
-	}
-
-	if _, err := New(&Config{Protocol: "ssh", Server: "example.com", Port: 22,
-		Advanced: Advanced{SSHHostKey: "not a fingerprint"}}); err == nil {
-		t.Fatal("a malformed pin must be rejected when the config is checked")
-	}
-}
+// The SSH host key pin tests live in hostkey_test.go.
