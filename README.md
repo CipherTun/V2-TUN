@@ -1,6 +1,25 @@
-# v2-tun
+<div align="center">
+
+<img src="docs/assets/banner.svg" alt="v2-tun: Xray-free tunnel library in Go" width="100%">
+
+<br>
+
+![module](https://img.shields.io/badge/module-io.surprise.vpn-22d3ee?style=for-the-badge&labelColor=0b1020)
+![android](https://img.shields.io/badge/Android-gomobile-a78bfa?style=for-the-badge&labelColor=0b1020)
+![ci](https://img.shields.io/badge/CI-vet%20%2B%20test%20--race-34d399?style=for-the-badge&labelColor=0b1020)
+![cli](https://img.shields.io/badge/CLI-Termux%20ready-f472b6?style=for-the-badge&labelColor=0b1020)
+
+**[Protocols](#-protocols)** • **[SSH over WebSocket](#-ssh-over-websocket-payload-no-tls-needed)** • **[Payload](#-payload-http-injector-style)** • **[Failover](#-failover-double-hop-and-keepalive)** • **[Routing](#-routing-split-tunneling-mux-and-udpgw)** • **[CLI](#-command-line)** • **[App API](#-app-api-gomobile)** • **[Roadmap](ROADMAP.md)**
+
+</div>
+
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## ⚡ What it is
 
 Xray-free tunnel library in Go. Module/namespace: `io.surprise.vpn`.
+
+<img src="docs/assets/flow.svg" alt="Connection chain: tcp, payload pre-tls, tls or reality, payload post-tls, transport, protocol" width="100%">
 
 Chain: tcp -> [payload pre-tls] -> tls or reality (SNI, ALPN, uTLS fingerprint) -> [payload post-tls] -> ws / httpupgrade / h2 / grpc / xhttp -> protocol.
 
@@ -10,10 +29,14 @@ hysteria 2 and hysteria 1.
 
 Local proxy: `mobile.Start(json, "127.0.0.1:10808")` runs SOCKS5 through the tunnel (feed it to tun2socks for TUN mode).
 
-Build: `go mod tidy && go vet ./... && go test ./...`
-Android: `gomobile bind -target=android -javapkg=io.surprise -o v2tun.aar io.surprise.vpn/mobile`
+```bash
+go mod tidy && go vet ./... && go test ./...      # build and test
+gomobile bind -target=android -javapkg=io.surprise -o v2tun.aar io.surprise.vpn/mobile   # Android
+```
 
-## Protocols
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 🧩 Protocols
 | `protocol` | Notes |
 | --- | --- |
 | `vless`, `vmess`, `trojan`, `shadowsocks` | TCP and UDP, Mux.Cool, any transport below; `vless` also takes `flow: xtls-rprx-vision` (see XTLS Vision) |
@@ -27,13 +50,18 @@ Android: `gomobile bind -target=android -javapkg=io.surprise -o v2tun.aar io.sur
 Socks and http proxies take the whole chain underneath them, so a payload, TLS with a fake SNI or a WebSocket can sit between you and the proxy.
 Share links: `socks5://user:pass@host:1080`, `socks4://host:1080`, `http://user:pass@host:8080`, `https://host:443`, `hysteria2://..`, `hysteria://..`.
 
-## SSH over WebSocket (payload, no TLS needed)
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 🔌 SSH over WebSocket (payload, no TLS needed)
 The usual injector setup is host:port, username, password, a payload and optionally an HTTP proxy. TLS is the user's choice (`tls.enabled`), never required:
 ```json
 {"protocol":"ssh","server":"ssh.example.com","port":80,"username":"user","password":"pass",
  "payload":{"template":"@ssh-ws","host":"bug.example.com"}}
 ```
 The `@ssh-ws` preset is `GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]`. The server answers `101 Switching Protocols` and then carries the raw SSH stream (no WebSocket framing), so the reply is read and dropped before SSH starts. That happens automatically for an HTTP-looking payload on a plain tcp stream; set `expectResponse` to `true` or `false` to override.
+
+> [!TIP]
+> Fronts that only let `CONNECT` through want the other variant: `@ssh-ws/tcp` (and its twin `@ssh-ws/udp`) sends `CONNECT [host_port]` with the same upgrade headers.
 
 Through an HTTP proxy (remote proxy mode), the TCP connection goes to the proxy and the payload names your real server in `[host_port]`:
 ```json
@@ -49,7 +77,40 @@ One reply is read per HTTP request line in the payload (here two: the proxy's 20
 ```
 Without a map, `101` and any `2xx` are accepted; `expectCodes` replaces that list (`0` accepts anything). With the map above a `301 Moved Permanently` works like `200 OK`; exact codes win over classes. Only the status line and headers of a reply are read, so a server that sends a body with its fake status should be avoided. The map applies to the payload layer, not to the http/https proxy protocol.
 
-## Hysteria
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 🧪 Payload (HTTP Injector style)
+`"payload": {"template": "@connect", "host": "bug.example.com", "stage": "pre-tls", "expectResponse": true, "expectResponses": 1, "expectCodes": [200], "responseMap": {"301": 200}, "vars": {"token": "abc"}, "proxy": "1.2.3.4:8080"}`
+- `template`: any template (tags are listed at the top of `payload/payload.go`: `[crlf]`, `[host_port]`, `[netData]`, `[split]`, `[delay=500]`, `[random=a|b]`, `[rotate=a|b]`, `[var=token]`, `[b64=...]`, `[rand_ua]`, ...; `[ssh]` is `[host_port]` and `[real_raw]` is `[raw]`) or a preset from the table below.
+- `stage`: `pre-tls` (default) sends the payload right after the TCP connect; `post-tls` sends it inside TLS.
+- `proxy`: remote proxy mode (see above). Pre-tls only.
+- `expectResponse`, `expectResponses`, `expectCodes`, `responseMap`: how the server's HTTP reply is handled (see above).
+- `host`, `method`, `userAgent`, `vars` fill `[host]`, `[method]`, `[ua]` and `[var=name]`; `[sni]` takes the TLS/REALITY server name.
+
+| preset | sends |
+| --- | --- |
+| `@connect`, `@split-connect` | `CONNECT host:port` (the split variant breaks the request into separate TCP segments) |
+| `@get`, `@head`, `@post` | `GET / `, `HEAD / `, `POST / ` with `Host` and `User-Agent` |
+| `@get-proxy`, `@head-proxy`, `@post-proxy` | the same with an absolute URI (`GET http://host/`), as sent to an HTTP proxy |
+| `@websocket` | `GET /` with `Upgrade: websocket` and a random `Sec-WebSocket-Key` |
+| `@ssh-ws` | `GET /` with `Upgrade: websocket`, plain text, no key |
+| `@ssh-ws/tcp`, `@ssh-ws/udp` | `CONNECT host:port` with `Upgrade: websocket` (both names are the same payload) |
+
+Preview any template without connecting: `v2tun payload -c config.json` or `mobile.PreviewPayload(template, host, port)`.
+
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 🛡️ Failover, double hop and keepalive
+- **Backups**: `backups` lists complete outbound configs (another server, bug host, payload or protocol) tried in order when the main one fails; the one that worked last is tried first next time. `failoverTimeoutSec` limits each attempt (default 12). `routing`, `udpgw` and `directDns` belong to the top-level config only, and backups cannot nest.
+- **Latency sort**: with `backups`, `latencySortSec: N` measures every N seconds how fast each server accepts a TCP connection and, after a failure, tries the quickest first (the one in use stays first until it fails). Hysteria and QUIC cannot be probed with a TCP connect and rank between answering and unreachable servers.
+- **SSH double hop**: `advanced.sshNext` turns the `ssh` protocol into two hops. The top-level server and credentials are the jump host, reached through the whole dial chain (payload, TLS, WebSocket, ...); `sshNext` is the second host, reached from inside the jump session, and is where traffic exits.
+- **Host key pinning**: `advanced.sshHostKey` (and `sshNext.hostKey`) take `SHA256:...` as printed by `ssh-keygen -l`, or 64 hex characters. Empty accepts any key.
+- **Keepalive**: `ws.pingSec` sends a WebSocket ping every N seconds on the ws transport so carriers and CDNs do not drop an idle tunnel; `idleTimeoutSec` closes a tunneled connection after that many seconds without data.
+- Which outbound is live: `mobile.ActiveOutbound()` (0 is the main config, 1 the first backup, -1 when nothing runs).
+
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 🐉 Hysteria
 ```json
 {"protocol":"hysteria2","server":"example.com","port":443,"password":"secret",
  "tls":{"sni":"example.com","allowInsecure":false},
@@ -60,26 +121,22 @@ Without a map, `101` and any `2xx` are accepted; `expectCodes` replaces that lis
 - Both run over one QUIC connection that is re-opened when it dies. TCP is a stream per connection and UDP rides on QUIC datagrams (fragmented when needed). They bring their own QUIC/TLS: `payload`, `reality`, `fragment` and other transports are rejected for them.
 - There is no Brutal congestion control in the client (quic-go has no hook for it), so uploads use quic-go's default.
 - Links: `hysteria2://auth@host:443/?sni=..&insecure=1&obfs=salamander&obfs-password=..&pinSHA256=..` and `hysteria://host:443?auth=..&peer=..&insecure=1&upmbps=..&downmbps=..&alpn=..&obfs=xplus&obfsParam=..`.
-- Written from the published protocol specs and checked against loopback tests only. Try it against your own server before relying on it.
 
-## Transports
+> [!WARNING]
+> Written from the published protocol specs and checked against loopback tests only. Try it against your own server before relying on it.
+
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 🚇 Transports
 tcp, ws, httpupgrade, h2 (http), grpc (gun, no grpc lib), quic (single stream), xhttp. TLS: allowInsecure, SNI, ALPN, uTLS fingerprints.
 Not yet: mKCP, the REALITY spiderX crawl.
 
-## Payload (HTTP Injector style)
-`"payload": {"template": "@connect", "host": "bug.example.com", "stage": "pre-tls", "expectResponse": true, "expectResponses": 1, "expectCodes": [200], "responseMap": {"301": 200}, "vars": {"token": "abc"}, "proxy": "1.2.3.4:8080"}`
-- `template`: any template (tags are listed at the top of `payload/payload.go`: `[crlf]`, `[host_port]`, `[netData]`, `[split]`, `[delay=500]`, `[random=a|b]`, `[rotate=a|b]`, `[var=token]`, `[b64=...]`, `[rand_ua]`, ...; `[ssh]` is `[host_port]` and `[real_raw]` is `[raw]`) or a preset: `@connect`, `@split-connect`, `@get`, `@head`, `@post`, `@websocket`, `@ssh-ws`.
-- `stage`: `pre-tls` (default) sends the payload right after the TCP connect; `post-tls` sends it inside TLS.
-- `proxy`: remote proxy mode (see above). Pre-tls only.
-- `expectResponse`, `expectResponses`, `expectCodes`, `responseMap`: how the server's HTTP reply is handled (see above).
-- `host`, `method`, `userAgent`, `vars` fill `[host]`, `[method]`, `[ua]` and `[var=name]`; `[sni]` takes the TLS/REALITY server name.
-
-## REALITY
+### REALITY
 Set `"reality": {"publicKey": "<pbk>", "shortId": "<sid hex>", "serverName": "<cover site>", "fingerprint": "chrome"}`
 (it replaces the `tls` layer; it works with tcp, h2, grpc and xhttp, not quic). Share links with `security=reality&pbk=..&sid=..&sni=..&fp=..`
 are parsed by `ParseLink`. A wrong key, shortId or server name fails with a clear error instead of hanging. Test it against your own server before relying on it.
 
-## XTLS Vision
+### XTLS Vision
 Set `"flow": "xtls-rprx-vision"` on a `vless` config, or use a share link with `flow=xtls-rprx-vision` (`-udp443` is accepted too). It needs the plain
 `tcp` transport with `tls.enabled` or `reality`. `New` and `ParseLink` reject it with ws/h2/grpc/xhttp/quic, without TLS or REALITY, with `mux`, and on any
 protocol other than `vless` (hysteria brings its own QUIC/TLS, so it never applies there). A pre-tls `payload` and `fragment` still work: the record layer
@@ -87,31 +144,80 @@ Vision needs sits directly under TLS/REALITY, above them.
 The client pads the inner TLS handshake and follows the server's switch to direct copy. It is based on Xray-core's behaviour and has only been
 tested against its own framing, not a live server, so try it against your own inbound before relying on it. Other flows are rejected.
 
-## TUN (Android)
-1. `go get gvisor.dev/gvisor@go && go mod tidy`
-2. In VpnService: `mobile.SetProtector { protect(it) }`, resolve the server hostname to an IP *before* establishing the VPN,
-   then `mobile.StartTun(json, pfd.detachFd().toLong(), 1500, "1.1.1.1:53")`.
-3. TCP, DNS and UDP are carried (UDP needs a protocol with native UDP, or `udpgw`).
-
-## Added in round 3
-- UDP relay: VLESS (cmd 2), VMess (cmd 2), Trojan (UDP ASSOCIATE), Shadowsocks (native UDP), Hysteria 1 and 2. TUN forwards all UDP through it; SSH, SOCKS and HTTP proxies have no UDP (use `udpgw`).
+### XHTTP, TLS fragmenting and share links
 - XHTTP/SplitHTTP: `network: "xhttp"`, `xhttpMode`: auto|packet-up|stream-up|stream-one, tuning via `xhttp: {xPaddingBytes, scMaxEachPostBytes, scMinPostsIntervalMs}`. Verify against your Xray version.
 - TLS fragmenting: `"fragment": {"length":[10,40], "interval":[5,20]}`.
 - Share links: `mobile.ParseLink(link)` -> JSON config (vless, vmess, trojan, ss, ssh, socks, http, hysteria).
-- `mobile.Ping`, `mobile.TrafficUp/Down`.
+- UDP relay: VLESS (cmd 2), VMess (cmd 2), Trojan (UDP ASSOCIATE), Shadowsocks (native UDP), Hysteria 1 and 2. TUN forwards all UDP through it; SSH, SOCKS and HTTP proxies have no UDP (use `udpgw`).
 
-## Round 4: routing, mux, BadVPN
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 🧭 Routing, split tunneling, Mux and udpgw
 - Routing (`routing`): rules with domain (`full:`, `domain:`, `keyword:`, `regexp:`, `dotless:`), ip (CIDR, `geoip:private`), port, network, sniffed `protocol`
   (http, tls, bittorrent, ssh; needs sniffing on the TUN), `time` window, `days`, and `notDomain`/`notIp`/`notPort`; actions proxy/direct/block;
   `domainStrategy`: asis | ipifnonmatch | ipondemand; `list:NAME`, `geoip:XX` and `geosite:XX` entries filled by `mobile.SetRouteList(name, "one per line")` (bring your own country lists).
 - Split tunneling: `"split": {"mode": "bypass"|"only", "domain": [], "ip": [], "port": ""}`; one-switch options `bypassLan`, `blockQuic`, `blockBittorrent`.
   Per-app split tunneling is done by the Android VpnService (`addAllowedApplication` / `addDisallowedApplication`).
+- Live changes: `mobile.UpdateRouting(json)` swaps the rules without reconnecting and `mobile.SetRouteLists(json)` loads several lists with one rebuild. Start with a `routing` section (it may be `{}`) to use them.
+- Debugging: `mobile.ExplainRoute("tcp", "host:443", "")` returns `{"action":"direct","rule":"builtin:lan-ip"}`.
 - Mux.Cool (`mux: {enabled, concurrency}`) for VLESS/VMess/Trojan/Shadowsocks, TCP + UDP sessions.
 - BadVPN udpgw (`udpgw: "127.0.0.1:7300"`): UDP over the SSH (or any) connection when the protocol has no native UDP.
 - `directDns` (default 1.1.1.1:53): protected resolver so hostnames (including your server's) never loop into the VPN.
 - `mobile.StartTunEx(json, fd, mtu, dns, fakeDNS, sniff)`: fake-IP DNS + SNI/Host sniffing so domain and protocol rules work on TUN traffic.
-Example routing: {"default":"proxy","domainStrategy":"ipifnonmatch","bypassLan":true,"rules":[{"action":"block","domain":["keyword:ads."]},{"action":"direct","domain":["list:local-sites"]}]}
 
-## Development
+Example routing:
+```json
+{"default":"proxy","domainStrategy":"ipifnonmatch","bypassLan":true,
+ "rules":[{"action":"block","domain":["keyword:ads."]},{"action":"direct","domain":["list:local-sites"]}]}
+```
+
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 📱 TUN (Android)
+1. `go get gvisor.dev/gvisor@go && go mod tidy`
+2. In VpnService: `mobile.SetProtector { protect(it) }`, resolve the server hostname to an IP *before* establishing the VPN,
+   then `mobile.StartTun(json, pfd.detachFd().toLong(), 1500, "1.1.1.1:53")`.
+3. TCP, DNS and UDP are carried (UDP needs a protocol with native UDP, or `udpgw`).
+
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 💻 Command line
+`cmd/v2tun` is a small CLI that runs in Termux, so a config can be tried on the phone without building the app.
+
+```text
+v2tun run       -c config.json [-l 127.0.0.1:10808] [-user U -pass P]   local SOCKS5 (CONNECT and UDP ASSOCIATE)
+v2tun link      <share link>                                            print the JSON config of a share link
+v2tun validate  -c config.json                                          check a config without connecting
+v2tun payload   -c config.json                                          show what the payload would send
+v2tun ping      -c config.json [-url URL]                               time to a first response
+v2tun speed     -c config.json [-url URL] [-t 10]                       download speed through the tunnel
+v2tun scan      -c config.json -hosts file [-field payload.host] [-j 3] [-t 15]   find hosts a network lets through
+```
+
+A config file of `-` is read from standard input. `scan` replaces one field (`payload.host`, `tls.sni`, `ws.host`, `payload.proxy` or `server`) with each line of the hosts file and reports which ones work, fastest first.
+
+> [!CAUTION]
+> Without `-user` and `-pass`, every app on the device that can reach the listener can use your tunnel. Keep it on `127.0.0.1` or set a password.
+
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 📲 App API (gomobile)
+All functions live in package `mobile` and take strings and numbers only.
+
+| area | functions |
+| --- | --- |
+| run | `Start`, `StartEx` (SOCKS5 with optional auth), `Stop`, `StartTun`, `StartTunEx`, `StopTun`, `SetProtector` |
+| configs and links | `ParseLink`, `Validate`, `Probe`, `Ping`, `SpeedTest`, `ScanHosts` |
+| payload | `ValidatePayload`, `PreviewPayload`, `PayloadPreview`, `PayloadPresets` |
+| routing | `SetRouteList`, `SetRouteLists`, `UpdateRouting`, `ExplainRoute` |
+| state | `ActiveOutbound`, `TrafficUp`, `TrafficDown`, `ResetTraffic` |
+
+`ValidatePayload` and `PreviewPayload` compile templates the way the tunnel does, so HTTP Injector spellings such as `[ssh]` and `[b64=random16]` preview as they will be sent.
+
+<img src="docs/assets/divider.svg" alt="" width="100%">
+
+## 🛠️ Development
 CI runs `go build`, `go vet` and `go test -race` on every push to `main` and `fix/**` and on pull requests, and uploads the resolved `go.mod` / `go.sum`.
 Commit the `go.sum` from that artifact (or from a local `go mod tidy`) so builds use pinned dependency versions.
+
+What is planned, and what needs a live server to verify: see the **[Roadmap](ROADMAP.md)**.
