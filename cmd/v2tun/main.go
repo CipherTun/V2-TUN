@@ -27,7 +27,8 @@ const usage = `v2tun - command line for the v2-tun library
 
 usage: v2tun <command> [flags]
 
-  run       -c config.json [-l 127.0.0.1:10808]   local SOCKS5 proxy through the config
+  run       -c config.json [-l 127.0.0.1:10808] [-user U -pass P]
+                                                  local SOCKS5 proxy (CONNECT and UDP ASSOCIATE)
   link      <share link>                          print the JSON config of a share link
   validate  -c config.json                        check a config without connecting
   payload   -c config.json                        show what the payload would send
@@ -102,6 +103,8 @@ func cmdRun(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ExitOnError)
 	conf := fs.String("c", "", "config file (JSON)")
 	listen := fs.String("l", "127.0.0.1:10808", "local SOCKS5 listen address")
+	user := fs.String("user", "", "SOCKS5 username (enables authentication)")
+	pass := fs.String("pass", "", "SOCKS5 password")
 	fs.Parse(args)
 	cfg, err := loadConfig(*conf)
 	if err != nil {
@@ -119,7 +122,7 @@ func cmdRun(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 	fmt.Fprintf(os.Stderr, "SOCKS5 proxy on %s (Ctrl+C to stop)\n", ln.Addr())
-	err = socks.Serve(ctx, ln, cl)
+	err = socks.ServeOpts(ctx, ln, cl, socks.Options{Username: *user, Password: *pass, UDP: cl})
 	up, down := v2tun.Traffic()
 	fmt.Fprintf(os.Stderr, "sent %d bytes, received %d bytes\n", up, down)
 	return err
