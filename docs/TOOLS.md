@@ -13,22 +13,27 @@ v2tun speed    -c config.json [-url URL] [-t 10]     download speed through the 
 v2tun scan     -c config.json -hosts hosts.txt       find which hosts a network lets through
 ```
 
-## Fallbacks (auto-failover)
-`fallbacks` is a list of complete alternative configs. When a connection fails
-through the main config, they are tried in order, each limited to 12 seconds;
-the one that worked last is tried first next time. Use it for a second server,
-another bug host or payload, or another protocol:
+## Backups (auto-failover)
+`backups` is a list of complete alternative configs. When a connection fails
+through the main config, they are tried in order, each attempt limited to
+`failoverTimeoutSec` seconds (default 12); the one that worked last is tried
+first next time. Use it for a second server, another bug host or payload, or
+another protocol:
 ```json
 {"protocol":"ssh","server":"a.example.com","port":80,"username":"u","password":"p",
  "payload":{"template":"@ssh-ws","host":"bug1.example.com"},
- "fallbacks":[
+ "failoverTimeoutSec":10,
+ "backups":[
    {"protocol":"ssh","server":"a.example.com","port":80,"username":"u","password":"p","payload":{"template":"@ssh-ws","host":"bug2.example.com"}},
    {"protocol":"hysteria2","server":"b.example.com","port":443,"password":"secret"}
  ]}
 ```
-Routing, udpgw and directDns of the main config apply to all of them; a fallback
-cannot have fallbacks. `mobile.ActiveOutbound()` (0 = main config, 1 = first
-fallback, ...) tells which one is in use.
+`routing`, `udpgw` and `directDns` belong to the top-level config only: a backup
+that sets any of them is rejected, and so is a backup with backups of its own
+(list every backup in the top-level `backups`). `mobile.ActiveOutbound()` (0 =
+main config, 1 = first backup, ..., -1 when nothing is running) tells which one
+is in use. UDP uses the first outbound that can relay it, and falls back to
+`udpgw` when none can.
 
 ## Scanning for a working bug host
 `scan` and `mobile.ScanHosts` copy the config once per value of a field
@@ -39,10 +44,12 @@ up (payload accepted, login done). Keep the number of parallel probes low for SS
 servers that rate-limit logins.
 
 ## Payload preview
-`v2tun payload` and `mobile.PayloadPreview` render the payload exactly as it
-would be sent: where the TCP connection goes, each segment with its escapes
-visible, and whether and how the HTTP replies are checked (count, accepted
-codes, response changer). Nothing is sent.
+`v2tun payload` and `mobile.PayloadPreview` render the payload of a config
+exactly as it would be sent: where the TCP connection goes, each segment with its
+escapes visible and the pause after it, and whether and how the HTTP replies are
+checked (count, accepted codes, response changer). Nothing is sent.
+`mobile.PreviewPayload(template, host, port)` renders just a template, without a
+config.
 
 ## SSH host-key pinning
 `advanced.sshHostKey` pins the SSH server's key: an OpenSSH fingerprint
