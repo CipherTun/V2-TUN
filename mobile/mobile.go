@@ -106,13 +106,20 @@ func ExplainRoute(network, addr, protocol string) (string, error) {
 	return string(b), err
 }
 
-// ValidatePayload reports whether a payload template compiles.
-func ValidatePayload(template string) error { return payload.Validate(template) }
+// ValidatePayload reports whether a payload template compiles. It accepts the
+// same HTTP Injector spellings as the tunnel itself ([ssh], [real_raw],
+// [b64=random16], @ssh-ws).
+func ValidatePayload(template string) error {
+	_, err := payload.CompileCompat(template)
+	return err
+}
 
 // PreviewPayload renders a template with the given server host and port and
-// returns it with visible \r\n and markers where it is split or paused.
+// returns it with visible \r\n and markers where it is split or paused. The
+// template is compiled the way the tunnel compiles it, so aliases such as
+// [ssh] preview as they will be sent.
 func PreviewPayload(template, host string, port int) (string, error) {
-	t, err := payload.Compile(template)
+	t, err := payload.CompileCompat(template)
 	if err != nil {
 		return "", err
 	}
