@@ -233,6 +233,7 @@ type Client struct {
 	router   *route.Router
 	gw       *udpgw.Client
 	idle     time.Duration // idle timeout of tunneled connections, 0 = none
+	conns    connTable     // live tunneled connections (see Connections)
 }
 
 var ErrBlocked = errors.New("v2tun: blocked by routing rule")
@@ -523,11 +524,12 @@ func (c *Client) ActiveOutbound() int {
 	return 0
 }
 
-// Close releases long-lived resources: the SSH session, shared Mux.Cool
-// connections, Hysteria's QUIC connection and the udpgw stream. A Client that
-// is just dropped keeps them (and their keepalive goroutines) alive after the
-// VPN stops.
+// Close releases long-lived resources: live tracked connections, the SSH
+// session, shared Mux.Cool connections, Hysteria's QUIC connection and the
+// udpgw stream. A Client that is just dropped keeps them (and their keepalive
+// goroutines) alive after the VPN stops.
 func (c *Client) Close() error {
+	c.CloseConns()
 	if cl, ok := c.out.(io.Closer); ok {
 		cl.Close()
 	}
@@ -575,21 +577,26 @@ func (c *Client) DialContext(ctx context.Context, network, addr string) (net.Con
 		return nil, err
 	}
 	var conn net.Conn
+	via := "proxy"
 	switch act {
 	case route.Block:
 		return nil, ErrBlocked
 	case route.Direct:
+		via = "direct"
 		conn, err = c.direct.DialContext(ctx, "tcp", addr)
 	default:
 		conn, err = c.out.DialContext(ctx, network, addr)
 	}
 	if err != nil {
+		if via == "proxy" {
+			reportFault(err)
+		}
 		return nil, err
 	}
 	if c.idle > 0 {
 		conn = transport.NewTimeoutConn(conn, c.idle)
 	}
-	return countConn{conn}, nil
+	return c.conns.track(countConn{conn}, "tcp", addr, via), nil
 }
 
 // DialUDP returns a datagram conn (one Write/Read = one datagram) to addr.
@@ -601,10 +608,12 @@ func (c *Client) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
 		return nil, err
 	}
 	var conn net.Conn
+	via := "proxy"
 	switch {
 	case act == route.Block:
 		return nil, ErrBlocked
 	case act == route.Direct:
+		via = "direct"
 		conn, err = c.directUDP(ctx, addr)
 	default:
 		if proxy.SupportsUDP(c.out) {
@@ -622,9 +631,12 @@ func (c *Client) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
 		}
 	}
 	if err != nil {
+		if via == "proxy" && !errors.Is(err, proxy.ErrNotImplemented) {
+			reportFault(err)
+		}
 		return nil, err
 	}
-	return countConn{conn}, nil
+	return c.conns.track(countConn{conn}, "udp", addr, via), nil
 }
 
 // resolveAddr turns host:port into ip:port using the protected resolver.
