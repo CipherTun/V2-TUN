@@ -101,3 +101,64 @@ func ActiveOutbound() int {
 	}
 	return c.ActiveOutbound()
 }
+
+// OutboundCount says how many outbounds the running tunnel has: the main
+// config plus its backups, 0 when nothing is running.
+func OutboundCount() int {
+	mu.Lock()
+	c := active
+	mu.Unlock()
+	if c == nil {
+		return 0
+	}
+	return c.OutboundCount()
+}
+
+// SelectOutbound pins the running tunnel to one outbound (0 is the main
+// config, 1 the first backup, ...); a negative index returns to automatic
+// failover.
+func SelectOutbound(index int) error {
+	c, err := running()
+	if err != nil {
+		return err
+	}
+	return c.SelectOutbound(index)
+}
+
+// Connections lists the live tunneled connections as a JSON array of
+// {"id","network","target","via","startedMs","up","down"}, oldest first.
+// It is "[]" when nothing is running.
+func Connections() (string, error) {
+	mu.Lock()
+	c := active
+	mu.Unlock()
+	if c == nil {
+		return "[]", nil
+	}
+	b, err := json.Marshal(c.Connections())
+	return string(b), err
+}
+
+// CloseConn closes one live connection by the id Connections reports. It
+// returns false when the connection already ended.
+func CloseConn(id int64) bool {
+	mu.Lock()
+	c := active
+	mu.Unlock()
+	if c == nil {
+		return false
+	}
+	return c.CloseConn(id)
+}
+
+// CloseConns closes every live tunneled connection and returns how many there
+// were.
+func CloseConns() int {
+	mu.Lock()
+	c := active
+	mu.Unlock()
+	if c == nil {
+		return 0
+	}
+	return c.CloseConns()
+}
