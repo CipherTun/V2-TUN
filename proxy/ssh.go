@@ -26,6 +26,9 @@ type SSH struct {
 	User       string
 	Password   string
 	PrivateKey []byte
+	// Passphrase decrypts PrivateKey when the key is encrypted. It is ignored
+	// for a key without a passphrase.
+	Passphrase string
 	Options    SSHOptions
 	// HostKeySHA256 pins the server's host key: an OpenSSH fingerprint
 	// ("SHA256:...", as printed by ssh-keygen -l) or 64 hex characters. Empty
@@ -34,6 +37,28 @@ type SSH struct {
 	HostKeySHA256 string
 	mu            sync.Mutex
 	client        *ssh.Client
+}
+
+// ParsePrivateKey parses a PEM or OpenSSH private key. An encrypted key needs
+// its passphrase; a key without one is parsed as it is, whatever passphrase is
+// given.
+func ParsePrivateKey(pem []byte, passphrase string) (ssh.Signer, error) {
+	signer, err := ssh.ParsePrivateKey(pem)
+	if err == nil {
+		return signer, nil
+	}
+	var missing *ssh.PassphraseMissingError
+	if !errors.As(err, &missing) {
+		return nil, err
+	}
+	if passphrase == "" {
+		return nil, errors.New("ssh: the private key is encrypted; set its passphrase")
+	}
+	signer, err = ssh.ParsePrivateKeyWithPassphrase(pem, []byte(passphrase))
+	if err != nil {
+		return nil, fmt.Errorf("ssh: cannot decrypt the private key (wrong passphrase?): %w", err)
+	}
+	return signer, nil
 }
 
 // parsePin decodes a host key pin into the 32-byte SHA-256 of the key blob.
@@ -92,7 +117,7 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 		HostKeyAlgorithms: pick(s.Options.HostKeyAlgos, sshHostKeys),
 	}
 	if len(s.PrivateKey) > 0 {
-		signer, err := ssh.ParsePrivateKey(s.PrivateKey)
+		signer, err := ParsePrivateKey(s.PrivateKey, s.Passphrase)
 		if err != nil {
 			raw.Close()
 			return nil, err
