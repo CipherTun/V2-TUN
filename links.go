@@ -64,6 +64,16 @@ func applyQuery(cfg *Config, q url.Values) error {
 	cfg.WS.Path = q.Get("path")
 	cfg.XHTTPMode = q.Get("mode")
 	cfg.GRPCService = q.Get("serviceName")
+	if n == "grpc" && strings.EqualFold(q.Get("mode"), "multi") {
+		cfg.GRPCMulti = true
+	}
+	if n == "xhttp" {
+		if x := q.Get("extra"); x != "" {
+			if err := applyXHTTPExtra(cfg, x); err != nil {
+				return err
+			}
+		}
+	}
 	switch sec := strings.ToLower(q.Get("security")); sec {
 	case "tls":
 		cfg.TLS.Enabled = true
@@ -192,6 +202,7 @@ func parseVMess(rest string) (*Config, string, error) {
 	cfg.WS.Host, cfg.WS.Path = str("host"), str("path")
 	if cfg.Network == "grpc" {
 		cfg.GRPCService = str("path")
+		cfg.GRPCMulti = strings.EqualFold(str("type"), "multi")
 	}
 	cfg.TLS.Enabled = str("tls") == "tls"
 	cfg.TLS.SNI = str("sni")
@@ -253,4 +264,132 @@ func splitHostPort(hp string) (string, int, error) {
 	}
 	p, err := strconv.Atoi(u.Port())
 	return u.Hostname(), p, err
+}
+
+// applyXHTTPExtra reads the "extra" JSON of an xhttp share link (Xray's
+// XHTTP extra settings): xPaddingBytes, scMaxEachPostBytes,
+// scMinPostsIntervalMs, headers and downloadSettings. Ranges ("100-1000" or
+// {"from":100,"to":1000}) are accepted; padding keeps the range, the other two
+// take its lower bound. Keys that have no equivalent here (xmux, noGRPCHeader,
+// ...) are ignored; downloadSettings that cannot be honored are an error.
+func applyXHTTPExtra(cfg *Config, raw string) error {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(raw), &m); err != nil {
+		return fmt.Errorf("link: bad xhttp extra: %w", err)
+	}
+	o := cfg.XHTTP
+	if o == nil {
+		o = &XHTTPOptions{}
+	}
+	if lo, hi, ok := jsonRange(m["xPaddingBytes"]); ok {
+		o.XPaddingBytes = [2]int{lo, hi}
+	}
+	if lo, _, ok := jsonRange(m["scMaxEachPostBytes"]); ok {
+		o.ScMaxEachPostBytes = lo
+	}
+	if lo, _, ok := jsonRange(m["scMinPostsIntervalMs"]); ok {
+		o.ScMinPostsIntervalMs = lo
+	}
+	if h, ok := m["headers"].(map[string]any); ok {
+		if cfg.WS.Headers == nil {
+			cfg.WS.Headers = map[string]string{}
+		}
+		for k, v := range h {
+			if sv, ok := v.(string); ok {
+				cfg.WS.Headers[k] = sv
+			}
+		}
+	}
+	if ds, ok := m["downloadSettings"].(map[string]any); ok {
+		dl, err := parseXHTTPDownload(ds)
+		if err != nil {
+			return err
+		}
+		o.Download = dl
+	}
+	cfg.XHTTP = o
+	return nil
+}
+
+// jsonRange reads a number, a "lo-hi" string or a {"from":..,"to":..} object.
+func jsonRange(v any) (lo, hi int, ok bool) {
+	switch t := v.(type) {
+	case float64:
+		return int(t), int(t), true
+	case string:
+		a, b, _ := strings.Cut(strings.TrimSpace(t), "-")
+		l, err := strconv.Atoi(a)
+		if err != nil {
+			return 0, 0, false
+		}
+		h := l
+		if b != "" {
+			if h, err = strconv.Atoi(b); err != nil {
+				return 0, 0, false
+			}
+		}
+		return l, h, true
+	case map[string]any:
+		f, ok1 := t["from"].(float64)
+		to, ok2 := t["to"].(float64)
+		if ok1 && ok2 {
+			return int(f), int(to), true
+		}
+	}
+	return 0, 0, false
+}
+
+func parseXHTTPDownload(ds map[string]any) (*XHTTPDownloadConfig, error) {
+	str := func(m map[string]any, k string) string { s, _ := m[k].(string); return s }
+	if n := strings.ToLower(str(ds, "network")); n != "" && n != "xhttp" && n != "splithttp" {
+		return nil, fmt.Errorf("link: xhttp downloadSettings network %q is not supported (only xhttp)", n)
+	}
+	dl := &XHTTPDownloadConfig{Server: str(ds, "address")}
+	if p, ok := ds["port"].(float64); ok {
+		dl.Port = int(p)
+	}
+	switch sec := strings.ToLower(str(ds, "security")); sec {
+	case "tls":
+		dl.TLS.Enabled = true
+		if t, ok := ds["tlsSettings"].(map[string]any); ok {
+			dl.TLS.SNI = str(t, "serverName")
+			dl.TLS.Fingerprint = str(t, "fingerprint")
+			if b, ok := t["allowInsecure"].(bool); ok {
+				dl.TLS.AllowInsecure = b
+			}
+			if a, ok := t["alpn"].([]any); ok {
+				for _, x := range a {
+					if xs, ok := x.(string); ok {
+						dl.TLS.ALPN = append(dl.TLS.ALPN, xs)
+					}
+				}
+			}
+		}
+	case "reality":
+		r, _ := ds["realitySettings"].(map[string]any)
+		if str(r, "publicKey") == "" {
+			return nil, errors.New("link: xhttp downloadSettings reality has no publicKey")
+		}
+		dl.Reality = &RealityConfig{PublicKey: str(r, "publicKey"), ShortID: str(r, "shortId"),
+			ServerName: str(r, "serverName"), Fingerprint: str(r, "fingerprint")}
+	case "", "none":
+	default:
+		return nil, fmt.Errorf("link: xhttp downloadSettings: unknown security %q", sec)
+	}
+	if x, ok := ds["xhttpSettings"].(map[string]any); ok {
+		dl.Host, dl.Path = str(x, "host"), str(x, "path")
+		hdrs, _ := x["headers"].(map[string]any)
+		if e, ok := x["extra"].(map[string]any); ok && hdrs == nil {
+			hdrs, _ = e["headers"].(map[string]any)
+		}
+		for k, v := range hdrs {
+			if sv, ok := v.(string); ok {
+				if dl.Headers == nil {
+					dl.Headers = map[string]string{}
+				}
+				dl.Headers[k] = sv
+			}
+		}
+	}
+	return dl, nil
 }
