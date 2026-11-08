@@ -105,6 +105,39 @@ type WSConfig struct {
 	// PingSec sends a WebSocket ping frame every N seconds (ws transport only,
 	// 0 = off) so carriers and CDNs do not drop an idle tunnel.
 	PingSec int `json:"pingSec,omitempty"`
+	// MaxEarlyData sends up to this many bytes of the first write in the
+	// upgrade request (ws transport only; the "?ed=2048" of share links, which
+	// ParseLink moves here). 0 = off. A "?ed=N" left in Path is honored too.
+	MaxEarlyData int `json:"maxEarlyData,omitempty"`
+}
+
+// splitEarlyData removes an "ed=N" parameter from a WebSocket path and returns
+// the path without it and N (0 when absent or not a positive number).
+func splitEarlyData(path string) (string, int) {
+	p, q, ok := strings.Cut(path, "?")
+	if !ok {
+		return path, 0
+	}
+	ed := 0
+	var keep []string
+	for _, kv := range strings.Split(q, "&") {
+		if k, v, _ := strings.Cut(kv, "="); k == "ed" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 {
+				ed = n
+			}
+			continue
+		}
+		if kv != "" {
+			keep = append(keep, kv)
+		}
+	}
+	if ed == 0 {
+		return path, 0
+	}
+	if len(keep) > 0 {
+		p += "?" + strings.Join(keep, "&")
+	}
+	return p, ed
 }
 
 // XHTTPOptions tunes the XHTTP client; zero values use Xray's defaults.
@@ -112,6 +145,23 @@ type XHTTPOptions struct {
 	XPaddingBytes        [2]int `json:"xPaddingBytes"`        // default 100..1000
 	ScMaxEachPostBytes   int    `json:"scMaxEachPostBytes"`   // default 1000000
 	ScMinPostsIntervalMs int    `json:"scMinPostsIntervalMs"` // default 30
+	// Download sends the download leg through its own connection (Xray's
+	// downloadSettings): another address, TLS/REALITY settings or CDN. Needs
+	// xhttpMode packet-up, stream-up or auto (not stream-one).
+	Download *XHTTPDownloadConfig `json:"download,omitempty"`
+}
+
+// XHTTPDownloadConfig is the separate download connection of an XHTTP session.
+// Empty fields fall back to the upload side: server, port and path to the
+// main config's, host to ws.host.
+type XHTTPDownloadConfig struct {
+	Server  string            `json:"server,omitempty"`
+	Port    int               `json:"port,omitempty"`
+	TLS     TLSConfig         `json:"tls"`
+	Reality *RealityConfig    `json:"reality,omitempty"`
+	Host    string            `json:"host,omitempty"`
+	Path    string            `json:"path,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // Advanced holds optional knobs the UI does not need to expose.
@@ -150,6 +200,9 @@ type Config struct {
 	Protocol    string        `json:"protocol"`
 	Network     string        `json:"network"` // tcp (default)|ws|httpupgrade|h2|grpc|quic|kcp|xhttp
 	GRPCService string        `json:"grpcService"`
+	// GRPCMulti selects the gRPC "multi" mode (TunMulti, Xray's multiMode; the
+	// "mode=multi" of share links). The server must use the same mode.
+	GRPCMulti   bool          `json:"grpcMulti,omitempty"`
 	XHTTPMode   string        `json:"xhttpMode"` // auto|packet-up|stream-up|stream-one
 	XHTTP       *XHTTPOptions `json:"xhttp,omitempty"`
 	Fragment    *FragmentConfig `json:"fragment,omitempty"`
@@ -436,13 +489,24 @@ func buildOutbound(cfg *Config, res *net.Resolver) (proxy.Outbound, time.Duratio
 			Host: cfg.WS.Host, Path: cfg.WS.Path, Mode: cfg.XHTTPMode, Headers: cfg.WS.Headers}
 		if o := cfg.XHTTP; o != nil {
 			x.XPaddingBytes, x.ScMaxEachPostBytes, x.ScMinPostsIntervalMs = o.XPaddingBytes, o.ScMaxEachPostBytes, o.ScMinPostsIntervalMs
+			if o.Download != nil {
+				dl, err := buildXHTTPDownload(cfg, o.Download, to, res)
+				if err != nil {
+					return nil, 0, err
+				}
+				x.Download = dl
+			}
 		}
 		d = x
 	case "grpc":
-		d = &transport.GRPC{Inner: d, TLS: tlsOn, Host: cfg.WS.Host, Service: cfg.GRPCService}
+		d = &transport.GRPC{Inner: d, TLS: tlsOn, Host: cfg.WS.Host, Service: cfg.GRPCService, Multi: cfg.GRPCMulti}
 	case "quic", "kcp", "mkcp":
 	case "ws", "websocket":
-		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers, PingSec: cfg.WS.PingSec}
+		wpath, ed := splitEarlyData(cfg.WS.Path)
+		if cfg.WS.MaxEarlyData > 0 {
+			ed = cfg.WS.MaxEarlyData
+		}
+		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: wpath, Headers: cfg.WS.Headers, PingSec: cfg.WS.PingSec, MaxEarlyData: ed}
 	case "httpupgrade":
 		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers, Upgrade: true}
 	default:
@@ -848,4 +912,39 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 		d = pd
 	}
 	return d, nil
+}
+
+// buildXHTTPDownload builds the separate download connection of an XHTTP
+// session: its own TCP -> [fragment] -> TLS|REALITY chain towards the download
+// server. The payload layer is not repeated there.
+func buildXHTTPDownload(cfg *Config, o *XHTTPDownloadConfig, to time.Duration, res *net.Resolver) (*transport.XHTTPDownload, error) {
+	if m := strings.ToLower(cfg.XHTTPMode); m == "stream-one" {
+		return nil, errors.New("v2tun: xhttp download settings need packet-up or stream-up, not stream-one")
+	}
+	server, port := o.Server, o.Port
+	if server == "" {
+		server = cfg.Server
+	}
+	if port == 0 {
+		port = cfg.Port
+	}
+	dc := &Config{Protocol: cfg.Protocol, Network: "xhttp", Server: server, Port: port,
+		TLS: o.TLS, Reality: o.Reality, Fragment: cfg.Fragment}
+	if err := checkFingerprints(dc); err != nil {
+		return nil, err
+	}
+	if err := checkTLSVerify(dc); err != nil {
+		return nil, err
+	}
+	alpn := dc.TLS.ALPN
+	if len(alpn) == 0 {
+		alpn = []string{"h2"}
+	}
+	d, err := baseChain(dc, "xhttp", to, alpn, res)
+	if err != nil {
+		return nil, err
+	}
+	return &transport.XHTTPDownload{Inner: d, Server: net.JoinHostPort(server, fmt.Sprint(port)),
+		TLS: dc.TLS.Enabled || dc.Reality != nil, SNI: dc.TLS.SNI, ALPN: alpn,
+		Host: o.Host, Path: o.Path, Headers: o.Headers}, nil
 }
