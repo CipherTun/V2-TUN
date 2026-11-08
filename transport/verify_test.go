@@ -3,6 +3,7 @@ package transport
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/x509"
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
@@ -45,7 +46,7 @@ func TestNormalizePin(t *testing.T) {
 
 func TestNameVerifierRejectsBadInput(t *testing.T) {
 	called := false
-	v := nameVerifier("example.com", func([][]byte, [][]*x509Certificate) error {
+	v := nameVerifier("example.com", func([][]byte, [][]*x509.Certificate) error {
 		called = true
 		return nil
 	})
