@@ -40,7 +40,7 @@ gomobile bind -target=android -javapkg=io.surprise -o v2tun.aar io.surprise.vpn/
 | `protocol` | Notes |
 | --- | --- |
 | `vless`, `vmess`, `trojan`, `shadowsocks` | TCP and UDP, Mux.Cool, any transport below; `vless` also takes `flow: xtls-rprx-vision` (see XTLS Vision) |
-| `ssh` | direct-tcpip; UDP through udpgw. TLS is optional, see SSH over WebSocket |
+| `ssh` | direct-tcpip; UDP through udpgw. TLS is optional, see SSH over WebSocket. Login with `password`, or `privateKey` (PEM text or a file path) plus `passphrase` when the key is encrypted |
 | `socks5` (`socks`) | CONNECT, optional username/password; UDP through udpgw |
 | `socks4` (`socks4a`) | CONNECT; the user id is `username`; host names use SOCKS4a |
 | `http` / `https` | CONNECT with Basic auth (`username`/`password`) and extra headers (`proxyHeaders`); `https` needs `tls.enabled` |
@@ -103,8 +103,9 @@ Preview any template without connecting: `v2tun payload -c config.json` or `mobi
 ## 🛡️ Failover, double hop and keepalive
 - **Backups**: `backups` lists complete outbound configs (another server, bug host, payload or protocol) tried in order when the main one fails; the one that worked last is tried first next time. `failoverTimeoutSec` limits each attempt (default 12). `routing`, `udpgw` and `directDns` belong to the top-level config only, and backups cannot nest.
 - **Latency sort**: with `backups`, `latencySortSec: N` measures every N seconds how fast each server accepts a TCP connection and, after a failure, tries the quickest first (the one in use stays first until it fails). Hysteria and QUIC cannot be probed with a TCP connect and rank between answering and unreachable servers.
-- **SSH double hop**: `advanced.sshNext` turns the `ssh` protocol into two hops. The top-level server and credentials are the jump host, reached through the whole dial chain (payload, TLS, WebSocket, ...); `sshNext` is the second host, reached from inside the jump session, and is where traffic exits.
+- **SSH double hop**: `advanced.sshNext` turns the `ssh` protocol into two hops. The top-level server and credentials are the jump host, reached through the whole dial chain (payload, TLS, WebSocket, ...); `sshNext` is the second host, reached from inside the jump session, and is where traffic exits. The second hop takes `password`, or `privateKey` with `passphrase`.
 - **Host key pinning**: `advanced.sshHostKey` (and `sshNext.hostKey`) take `SHA256:...` as printed by `ssh-keygen -l`, or 64 hex characters. Empty accepts any key.
+- **Encrypted keys**: `passphrase` (and `sshNext.passphrase`) decrypts an encrypted `privateKey`. An encrypted key without a passphrase fails with a clear error instead of an authentication failure; a key that is not encrypted ignores the passphrase.
 - **Keepalive**: `ws.pingSec` sends a WebSocket ping every N seconds on the ws transport so carriers and CDNs do not drop an idle tunnel; `idleTimeoutSec` closes a tunneled connection after that many seconds without data.
 - Which outbound is live: `mobile.ActiveOutbound()` (0 is the main config, 1 the first backup, -1 when nothing runs).
 
@@ -118,7 +119,7 @@ Preview any template without connecting: `v2tun payload -c config.json` or `mobi
 ```
 - **Hysteria 2**: `password` is the auth string, `hysteria.obfs` the Salamander password, `hysteria.pinSha256` pins the server certificate (replaces CA checks), `hysteria.downMbps` advertises your receive rate (0 lets the server decide). Port hopping is not supported.
 - **Hysteria 1**: `password` is the auth string, `hysteria.obfs` the xplus password, `hysteria.alpn` defaults to `hysteria`. `upMbps` (default 10) and `downMbps` (default 50) are required by the server, and **the server sends at the `downMbps` you declare**, so set it to what your link can take. faketcp and wechat-video are not supported.
-- Both run over one QUIC connection that is re-opened when it dies. TCP is a stream per connection and UDP rides on QUIC datagrams (fragmented when needed). They bring their own QUIC/TLS: `payload`, `reality`, `fragment` and other transports are rejected for them.
+- Both run over one QUIC connection that is re-opened when it dies. TCP is a stream per connection and UDP rides on QUIC datagrams (fragmented when needed). They bring their own QUIC/TLS: `payload`, `reality`, `fragment` and other transports are rejected for them, and so are `tls.pinSha256` and `tls.verifyName` (use `hysteria.pinSha256`).
 - There is no Brutal congestion control in the client (quic-go has no hook for it), so uploads use quic-go's default.
 - Links: `hysteria2://auth@host:443/?sni=..&insecure=1&obfs=salamander&obfs-password=..&pinSHA256=..` and `hysteria://host:443?auth=..&peer=..&insecure=1&upmbps=..&downmbps=..&alpn=..&obfs=xplus&obfsParam=..`.
 
@@ -128,8 +129,17 @@ Preview any template without connecting: `v2tun payload -c config.json` or `mobi
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
 ## 🚇 Transports
-tcp, ws, httpupgrade, h2 (http), grpc (gun, no grpc lib), quic (single stream), xhttp. TLS: allowInsecure, SNI, ALPN, uTLS fingerprints.
+tcp, ws, httpupgrade, h2 (http), grpc (gun, no grpc lib), quic (single stream), xhttp. TLS: allowInsecure, SNI, ALPN, uTLS fingerprints, certificate pinning and a verify name (below).
 Not yet: mKCP, the REALITY spiderX crawl.
+
+### TLS certificate pinning and verify name
+```json
+"tls": {"enabled": true, "sni": "cdn.example.com", "pinSha256": ["a1b2...64 hex characters"], "verifyName": "origin.example.com"}
+```
+- `pinSha256`: hex SHA-256 of a DER certificate (colons allowed). The handshake succeeds only when a certificate of the server's chain matches one of the pins. It is checked on top of normal verification and also with `allowInsecure`, so a self-signed server can be trusted by pin alone. `openssl s_client -connect host:443 </dev/null | openssl x509 -outform DER | sha256sum` prints the value.
+- `verifyName`: verify the certificate for this name instead of the SNI, for a front that sends one name and presents another. The chain is still checked against the system roots, and `allowInsecure` turns the check off.
+- Both need `tls.enabled` and are rejected (rather than silently ignored) with REALITY, the quic transport, or the hysteria protocols, which do their own TLS. Encrypted Client Hello is not supported.
+- Covered by loopback tests (a real TLS handshake against a local server for the pin); `verifyName` is only tested for its failure paths, so try it against your own server.
 
 ### REALITY
 Set `"reality": {"publicKey": "<pbk>", "shortId": "<sid hex>", "serverName": "<cover site>", "fingerprint": "chrome"}`
@@ -177,7 +187,7 @@ Example routing:
 1. `go get gvisor.dev/gvisor@go && go mod tidy`
 2. In VpnService: `mobile.SetProtector { protect(it) }`, resolve the server hostname to an IP *before* establishing the VPN,
    then `mobile.StartTun(json, pfd.detachFd().toLong(), 1500, "1.1.1.1:53")`.
-3. TCP, DNS and UDP are carried (UDP needs a protocol with native UDP, or `udpgw`).
+3. TCP, DNS and UDP are carried (UDP needs a protocol with native UDP, or `udpgw`). IPv4 only: IPv6 packets are not carried through the TUN yet, so route `::/0` into the VPN interface and let it drop (as the app does) rather than leave IPv6 outside the tunnel.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
