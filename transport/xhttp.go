@@ -49,9 +49,29 @@ type XHTTP struct {
 	ScMaxEachPostBytes   int    // default 1_000_000
 	ScMinPostsIntervalMs int    // default 30
 
+	// Download, when set, sends the download (GET) leg through its own
+	// connection chain, e.g. to another address or through another CDN
+	// (Xray's downloadSettings). The uploads keep using the fields above.
+	// It needs stream-up or packet-up; stream-one has no separate download.
+	Download *XHTTPDownload
+
 	once    sync.Once
 	client  *http.Client
+	dclient *http.Client // download leg; nil unless Download is set
 	initErr error
+}
+
+// XHTTPDownload describes the separate download connection of an XHTTP
+// session (see XHTTP.Download).
+type XHTTPDownload struct {
+	Inner   Dialer // TCP (+TLS/REALITY) layers towards the download server
+	Server  string // "host:port"; empty => the upload server
+	TLS     bool
+	SNI     string
+	ALPN    []string
+	Host    string
+	Path    string            // empty => the upload path
+	Headers map[string]string // nil => the upload headers
 }
 
 const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
@@ -63,55 +83,92 @@ func (d *XHTTP) setup(addr string) error {
 		if d.Server == "" {
 			d.Server = addr
 		}
-		h2 := true
-		switch {
-		case !d.TLS:
-			h2 = false
-		case len(d.ALPN) == 1 && d.ALPN[0] == "http/1.1":
-			h2 = false
-		case len(d.ALPN) == 1 && d.ALPN[0] == "h3":
-			d.initErr = errors.New("xhttp: HTTP/3 is not supported")
+		d.client, d.initErr = newXHTTPClient(d.Inner, d.Server, d.TLS, d.ALPN)
+		if d.initErr != nil {
 			return
 		}
-		dial := func(ctx context.Context) (net.Conn, error) {
-			return d.Inner.DialContext(ctx, "tcp", d.Server)
-		}
-		var rt http.RoundTripper
-		if h2 {
-			rt = &http2.Transport{
-				DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
-					return dial(ctx)
-				},
-				IdleConnTimeout: 90 * time.Second,
-				ReadIdleTimeout: 45 * time.Second, // Chrome's H2 keep-alive period
+		if dl := d.Download; dl != nil {
+			if dl.Inner == nil {
+				d.initErr = errors.New("xhttp: download settings need a dialer")
+				return
 			}
-		} else {
-			rt = &http.Transport{
-				DialContext:        func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
-				DialTLSContext:     func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
-				IdleConnTimeout:    90 * time.Second,
-				DisableKeepAlives:  true, // one connection per request, like Xray's HTTP/1.1 path
-				DisableCompression: true,
+			if dl.Server == "" {
+				dl.Server = d.Server
 			}
+			d.dclient, d.initErr = newXHTTPClient(dl.Inner, dl.Server, dl.TLS, dl.ALPN)
 		}
-		d.client = &http.Client{Transport: rt}
 	})
 	return d.initErr
 }
 
+// newXHTTPClient builds the HTTP client of one XHTTP leg: HTTP/2 over TLS
+// unless the ALPN list is exactly "http/1.1", HTTP/1.1 without TLS.
+func newXHTTPClient(inner Dialer, server string, tlsOn bool, alpn []string) (*http.Client, error) {
+	h2 := true
+	switch {
+	case !tlsOn:
+		h2 = false
+	case len(alpn) == 1 && alpn[0] == "http/1.1":
+		h2 = false
+	case len(alpn) == 1 && alpn[0] == "h3":
+		return nil, errors.New("xhttp: HTTP/3 is not supported")
+	}
+	dial := func(ctx context.Context) (net.Conn, error) {
+		return inner.DialContext(ctx, "tcp", server)
+	}
+	var rt http.RoundTripper
+	if h2 {
+		rt = &http2.Transport{
+			DialTLSContext: func(ctx context.Context, _, _ string, _ *tls.Config) (net.Conn, error) {
+				return dial(ctx)
+			},
+			IdleConnTimeout: 90 * time.Second,
+			ReadIdleTimeout: 45 * time.Second, // Chrome's H2 keep-alive period
+		}
+	} else {
+		rt = &http.Transport{
+			DialContext:        func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
+			DialTLSContext:     func(ctx context.Context, _, _ string) (net.Conn, error) { return dial(ctx) },
+			IdleConnTimeout:    90 * time.Second,
+			DisableKeepAlives:  true, // one connection per request, like Xray's HTTP/1.1 path
+			DisableCompression: true,
+		}
+	}
+	return &http.Client{Transport: rt}, nil
+}
+
 func (d *XHTTP) baseURL() *url.URL {
+	return xhttpBase(d.TLS, d.Host, d.SNI, d.Server, d.Path)
+}
+
+// downloadBase is the URL of the download leg: the upload URL with whatever
+// Download overrides.
+func (d *XHTTP) downloadBase() *url.URL {
+	dl := d.Download
+	path := dl.Path
+	if path == "" {
+		path = d.Path
+	}
+	host, sni := dl.Host, dl.SNI
+	if host == "" && sni == "" {
+		host = d.Host // like the upload leg, unless the download names its own site
+	}
+	return xhttpBase(dl.TLS, host, sni, dl.Server, path)
+}
+
+func xhttpBase(tlsOn bool, host, sni, server, path string) *url.URL {
 	u := &url.URL{Scheme: "http"}
-	if d.TLS {
+	if tlsOn {
 		u.Scheme = "https"
 	}
-	u.Host = d.Host
+	u.Host = host
 	if u.Host == "" {
-		u.Host = d.SNI
+		u.Host = sni
 	}
 	if u.Host == "" {
-		u.Host, _, _ = net.SplitHostPort(d.Server)
+		u.Host, _, _ = net.SplitHostPort(server)
 	}
-	path, query, _ := strings.Cut(d.Path, "?")
+	path, query, _ := strings.Cut(path, "?")
 	if path == "" || path[0] != '/' {
 		path = "/" + path
 	}
@@ -122,9 +179,11 @@ func (d *XHTTP) baseURL() *url.URL {
 	return u
 }
 
-func (d *XHTTP) header() http.Header {
+func (d *XHTTP) header() http.Header { return xhttpHeader(d.Headers) }
+
+func xhttpHeader(m map[string]string) http.Header {
 	h := http.Header{}
-	for k, v := range d.Headers {
+	for k, v := range m {
 		h.Add(k, v)
 	}
 	if h.Get("User-Agent") == "" {
@@ -169,12 +228,16 @@ func appendPath(p, v string) string {
 }
 
 func (d *XHTTP) newRequest(ctx context.Context, method string, base *url.URL, session, seq string, body io.Reader) (*http.Request, error) {
+	return d.newRequestH(ctx, method, base, d.header(), session, seq, body)
+}
+
+func (d *XHTTP) newRequestH(ctx context.Context, method string, base *url.URL, hdr http.Header, session, seq string, body io.Reader) (*http.Request, error) {
 	u := *base
 	req, err := http.NewRequestWithContext(ctx, method, u.String(), body)
 	if err != nil {
 		return nil, err
 	}
-	req.Header = d.header()
+	req.Header = hdr
 	d.applyPadding(req) // computed from the URL before session/seq are appended
 	if session != "" {
 		req.URL.Path = appendPath(req.URL.Path, session)
@@ -210,6 +273,9 @@ func (d *XHTTP) DialContext(ctx context.Context, network, addr string) (net.Conn
 	case "packet-up", "stream-up", "stream-one":
 	default:
 		return nil, fmt.Errorf("xhttp: unknown mode %q", d.Mode)
+	}
+	if mode == "stream-one" && d.Download != nil {
+		return nil, errors.New("xhttp: download settings need packet-up or stream-up, not stream-one")
 	}
 	session := ""
 	if mode != "stream-one" {
@@ -282,7 +348,14 @@ func (c *xhttpConn) openDownload(body io.Reader) error {
 	ctx := httptrace.WithClientTrace(c.ctx, &httptrace.ClientTrace{
 		GotConn: func(httptrace.GotConnInfo) { gotOnce.Do(func() { close(gotConn) }) },
 	})
-	req, err := c.d.newRequest(ctx, method, c.base, c.session, "", body)
+	client, base, hdr := c.d.client, c.base, c.d.header()
+	if dl := c.d.Download; dl != nil && body == nil {
+		client, base = c.d.dclient, c.d.downloadBase()
+		if dl.Headers != nil {
+			hdr = xhttpHeader(dl.Headers)
+		}
+	}
+	req, err := c.d.newRequestH(ctx, method, base, hdr, c.session, "", body)
 	if err != nil {
 		return err
 	}
@@ -292,7 +365,7 @@ func (c *xhttpConn) openDownload(body io.Reader) error {
 	failed := make(chan error, 1)
 	go func() {
 		defer close(c.ready)
-		resp, err := c.d.client.Do(req)
+		resp, err := client.Do(req)
 		if err != nil {
 			c.rerr = err
 			failed <- err
