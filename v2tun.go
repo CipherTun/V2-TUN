@@ -26,6 +26,17 @@ type TLSConfig struct {
 	ALPN          []string `json:"alpn"`
 	AllowInsecure bool     `json:"allowInsecure"`
 	Fingerprint   string   `json:"fingerprint"` // chrome|firefox|safari|ios|android|edge|random
+	// PinSHA256 pins the server certificate: hex SHA-256 of the DER certificate
+	// (":" separators allowed), any certificate of the chain may match. It is
+	// checked on top of normal verification, and also with allowInsecure, so a
+	// self-signed server can be trusted by pin alone. Needs tls.enabled; the
+	// hysteria protocols use hysteria.pinSha256, REALITY and quic do not take it.
+	PinSHA256 []string `json:"pinSha256,omitempty"`
+	// VerifyName verifies the server certificate for this DNS name instead of
+	// the SNI (a fronting setup that sends one name and presents another). The
+	// chain is still checked against the system roots. Same restrictions as
+	// PinSHA256; allowInsecure turns the check off.
+	VerifyName string `json:"verifyName,omitempty"`
 }
 
 // RealityConfig enables REALITY in place of the TLS layer (TLS.Enabled is then
@@ -125,8 +136,9 @@ type SSHHop struct {
 	Server     string `json:"server"` // host:port as the jump host reaches it
 	Username   string `json:"username"`
 	Password   string `json:"password"`
-	PrivateKey string `json:"privateKey"`        // PEM text or a file path, like Config.PrivateKey
-	HostKey    string `json:"hostKey,omitempty"` // host key pin, like Advanced.SSHHostKey
+	PrivateKey string `json:"privateKey"`           // PEM text or a file path, like Config.PrivateKey
+	Passphrase string `json:"passphrase,omitempty"` // decrypts PrivateKey when it is encrypted
+	HostKey    string `json:"hostKey,omitempty"`    // host key pin, like Advanced.SSHHostKey
 }
 
 type Config struct {
@@ -135,21 +147,23 @@ type Config struct {
 	// hysteria2, "hy" is hysteria; "https" is an http proxy that needs
 	// tls.enabled). The hysteria protocols bring their own QUIC/TLS: payload,
 	// reality, fragment and the other transports do not apply to them.
-	Protocol     string            `json:"protocol"`
-	Network      string            `json:"network"` // tcp (default)|ws|httpupgrade|h2|grpc|quic|xhttp
-	GRPCService  string            `json:"grpcService"`
-	XHTTPMode    string            `json:"xhttpMode"` // auto|packet-up|stream-up|stream-one
-	XHTTP        *XHTTPOptions     `json:"xhttp,omitempty"`
-	Fragment     *FragmentConfig   `json:"fragment,omitempty"`
-	Server       string            `json:"server"`
-	Port         int               `json:"port"`
-	UUID         string            `json:"uuid"`
-	Flow         string            `json:"flow,omitempty"` // vless only: "xtls-rprx-vision" (see checkFlow)
-	AlterID      int               `json:"alterId"`
-	Password     string            `json:"password"`
-	Username     string            `json:"username"`
-	Method       string            `json:"method"`
-	PrivateKey   string            `json:"privateKey"`
+	Protocol    string        `json:"protocol"`
+	Network     string        `json:"network"` // tcp (default)|ws|httpupgrade|h2|grpc|quic|xhttp
+	GRPCService string        `json:"grpcService"`
+	XHTTPMode   string        `json:"xhttpMode"` // auto|packet-up|stream-up|stream-one
+	XHTTP       *XHTTPOptions `json:"xhttp,omitempty"`
+	Fragment    *FragmentConfig `json:"fragment,omitempty"`
+	Server      string        `json:"server"`
+	Port        int           `json:"port"`
+	UUID        string        `json:"uuid"`
+	Flow        string        `json:"flow,omitempty"` // vless only: "xtls-rprx-vision" (see checkFlow)
+	AlterID     int           `json:"alterId"`
+	Password    string        `json:"password"`
+	Username    string        `json:"username"`
+	Method      string        `json:"method"`
+	PrivateKey  string        `json:"privateKey"`
+	// Passphrase decrypts PrivateKey (ssh) when the key is encrypted.
+	Passphrase   string            `json:"passphrase,omitempty"`
 	ProxyHeaders map[string]string `json:"proxyHeaders,omitempty"` // extra headers for the http/https proxy CONNECT
 	TLS          TLSConfig         `json:"tls"`
 	Reality      *RealityConfig    `json:"reality,omitempty"`
@@ -244,6 +258,36 @@ func checkFingerprints(cfg *Config) error {
 	return nil
 }
 
+// checkTLSVerify validates tls.pinSha256 and tls.verifyName. A pin or a name
+// that the connection would silently ignore (no TLS layer, REALITY, QUIC, or a
+// hysteria protocol that does its own TLS) is rejected: a connection that runs
+// unpinned while the profile says pinned is worse than one that refuses to start.
+func checkTLSVerify(cfg *Config) error {
+	t := &cfg.TLS
+	if len(t.PinSHA256) == 0 && t.VerifyName == "" {
+		return nil
+	}
+	switch strings.ToLower(cfg.Protocol) {
+	case "hysteria", "hysteria1", "hy", "hysteria2", "hy2":
+		return errors.New("v2tun: hysteria does its own TLS; use hysteria.pinSha256 instead of tls.pinSha256 and tls.verifyName")
+	}
+	if cfg.Reality != nil {
+		return errors.New("v2tun: tls.pinSha256 and tls.verifyName do not apply to reality")
+	}
+	if strings.EqualFold(cfg.Network, "quic") {
+		return errors.New("v2tun: tls.pinSha256 and tls.verifyName do not apply to the quic transport")
+	}
+	if !t.Enabled {
+		return errors.New("v2tun: tls.pinSha256 and tls.verifyName need tls.enabled")
+	}
+	for _, p := range t.PinSHA256 {
+		if _, ok := transport.NormalizePin(p); !ok {
+			return fmt.Errorf("v2tun: tls.pinSha256 entry %q must be 64 hex characters (the SHA-256 of the certificate)", p)
+		}
+	}
+	return nil
+}
+
 // New builds the tunnel client: the outbound described by cfg, then cfg.Backups
 // behind a proxy.Failover when there are any, plus routing and udpgw.
 func New(cfg *Config) (*Client, error) {
@@ -327,6 +371,9 @@ func buildOutbound(cfg *Config, res *net.Resolver) (proxy.Outbound, time.Duratio
 	if err := checkFingerprints(cfg); err != nil {
 		return nil, 0, err
 	}
+	if err := checkTLSVerify(cfg); err != nil {
+		return nil, 0, err
+	}
 	to := time.Duration(cfg.TimeoutSec) * time.Second
 	if to == 0 {
 		to = 15 * time.Second
@@ -396,7 +443,7 @@ func buildOutbound(cfg *Config, res *net.Resolver) (proxy.Outbound, time.Duratio
 		opts := proxy.SSHOptions{Ciphers: cfg.Advanced.SSHCiphers, KeyExchanges: cfg.Advanced.SSHKeyExchanges,
 			MACs: cfg.Advanced.SSHMACs, HostKeyAlgos: cfg.Advanced.SSHHostKeys}
 		first := &proxy.SSH{Server: srv, Dialer: d, User: cfg.Username,
-			Password: cfg.Password, PrivateKey: readKey(cfg.PrivateKey),
+			Password: cfg.Password, PrivateKey: readKey(cfg.PrivateKey), Passphrase: cfg.Passphrase,
 			HostKeySHA256: cfg.Advanced.SSHHostKey, Options: opts}
 		out = first
 		if n := cfg.Advanced.SSHNext; n != nil {
@@ -409,7 +456,7 @@ func buildOutbound(cfg *Config, res *net.Resolver) (proxy.Outbound, time.Duratio
 				return nil, 0, errors.New(`v2tun: advanced.sshNext.hostKey must be "SHA256:..." (as ssh-keygen -l prints it) or 64 hex characters`)
 			}
 			out = proxy.NewDoubleHop(first, &proxy.SSH{Server: n.Server, User: n.Username,
-				Password: n.Password, PrivateKey: readKey(n.PrivateKey),
+				Password: n.Password, PrivateKey: readKey(n.PrivateKey), Passphrase: n.Passphrase,
 				HostKeySHA256: n.HostKey, Options: opts})
 		}
 	case "socks", "socks5":
@@ -741,7 +788,8 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 		d = rd
 	case cfg.TLS.Enabled:
 		d = &transport.TLS{Inner: d, ServerName: cfg.TLS.SNI, ALPN: alpn,
-			AllowInsecure: cfg.TLS.AllowInsecure, Fingerprint: cfg.TLS.Fingerprint}
+			AllowInsecure: cfg.TLS.AllowInsecure, Fingerprint: cfg.TLS.Fingerprint,
+			PinSHA256: cfg.TLS.PinSHA256, VerifyName: cfg.TLS.VerifyName}
 	}
 	if post {
 		pd.Inner = d
