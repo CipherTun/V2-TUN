@@ -22,6 +22,9 @@ type Failover struct {
 	rank  []int              // latency ranking (indexes into Outs) set by StartLatencyEngine; nil => list order
 	alive []bool             // reachability seen by the last latency probe; nil before the first one
 	stop  context.CancelFunc // stops the latency engine
+
+	pinned bool // Pin was called: only Outs[pin] is used
+	pin    int
 }
 
 var (
@@ -36,11 +39,34 @@ func (f *Failover) perTry() time.Duration {
 	return 12 * time.Second
 }
 
-// Current is the index of the outbound that worked last (0 is the first).
+// Current is the index of the outbound that worked last (0 is the first), or
+// the pinned one while pinned.
 func (f *Failover) Current() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.pinned {
+		return f.pin
+	}
 	return f.cur
+}
+
+// Pin makes outbound i (0 is the first) the only one used: when it fails,
+// dials fail instead of moving on to the next outbound. Unpin undoes it.
+func (f *Failover) Pin(i int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if i < 0 || i >= len(f.Outs) {
+		return fmt.Errorf("failover: outbound %d does not exist (have %d)", i, len(f.Outs))
+	}
+	f.pinned, f.pin, f.cur = true, i, i
+	return nil
+}
+
+// Unpin returns to automatic failover.
+func (f *Failover) Unpin() {
+	f.mu.Lock()
+	f.pinned = false
+	f.mu.Unlock()
 }
 
 // order is the sequence in which outbounds are tried: the one that worked last
@@ -48,6 +74,9 @@ func (f *Failover) Current() int {
 func (f *Failover) order() []int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.pinned && f.pin < len(f.Outs) {
+		return []int{f.pin}
+	}
 	n := len(f.Outs)
 	idx := make([]int, n)
 	if n > 0 && len(f.rank) == n {
@@ -156,6 +185,12 @@ func (f *Failover) Close() error {
 // its outbounds can), so that callers know when to fall back to udpgw.
 func SupportsUDP(o Outbound) bool {
 	if f, ok := o.(*Failover); ok {
+		f.mu.Lock()
+		pinned, pin := f.pinned, f.pin
+		f.mu.Unlock()
+		if pinned && pin < len(f.Outs) {
+			return SupportsUDP(f.Outs[pin])
+		}
 		for _, x := range f.Outs {
 			if SupportsUDP(x) {
 				return true
