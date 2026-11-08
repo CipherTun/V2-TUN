@@ -16,9 +16,10 @@ Everything under **Shipped** is described in the [README](README.md) and works a
 - **Protocols**: trojan, vless, vmess, shadowsocks, ssh, socks4/5, http/https proxies, Hysteria 1 and 2
 - **XTLS Vision** for vless (record layer, `checkFlow` validation); still untested against a live server, see below
 - **Transports**: tcp, ws, httpupgrade, h2, grpc, quic, **xhttp** (auto, packet-up, stream-up, stream-one), REALITY, TLS fragmenting
+- **TLS checks**: certificate pinning (`tls.pinSha256`) and a verify name (`tls.verifyName`); both are rejected where they would be ignored
 - **Payload engine**: HTTP Injector style tags and presets, `@ssh-ws`, `@ssh-ws/tcp`, response changer, remote proxy mode
-- **SSH extras**: double hop (`sshNext`), host key pinning
-- **Reliability**: failover with `backups`, latency sort, WebSocket ping, idle timeout
+- **SSH extras**: double hop (`sshNext`), host key pinning, encrypted private keys (`passphrase`)
+- **Reliability**: failover with `backups`, latency sort, WebSocket ping, HTTP/2 PING keepalive, idle timeout
 - **Routing**: rules, split tunneling, geoip/geosite lists, live `UpdateRouting`, `ExplainRoute`
 - **UDP**: native relay per protocol, udpgw, SOCKS5 UDP ASSOCIATE (also in the CLI `run` command)
 - **Tools**: `v2tun` CLI (run, link, validate, payload, ping, speed, scan), `Validate`, `SpeedTest`, `ScanHosts`
@@ -27,6 +28,7 @@ Everything under **Shipped** is described in the [README](README.md) and works a
 
 ## 🧪 Needs a real server or CI to do properly
 - **Interop tests in CI**: run the library against OpenSSH, Xray, a Hysteria server and a Trojan server in containers. Most protocol code was written from specs and is only tested against fakes written by the same author. This is also the only way to confirm **Vision**, **REALITY** and **XHTTP** against real inbounds. (A workflow file has to be added by hand: the GitHub connector cannot create workflows.)
+- **`tls.verifyName`** against a server that presents a certificate for another name than the SNI (the unit tests only cover its failure paths).
 
 ## 📋 Next up (ideas, roughly in this order)
 - **Reconnect on network change**: a `mobile.NetworkChanged()` call that drops dead sessions and redials when wifi and mobile data swap, plus a kill switch (the other half is the Android VpnService side)
