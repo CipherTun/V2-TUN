@@ -42,6 +42,10 @@ func (d *TCP) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 // at least one certificate (DER) the server sends matches. The pin is checked
 // in addition to normal verification, and also when AllowInsecure is set, so a
 // self-signed server can be trusted by pin alone. Empty means no pinning.
+// VerifyName verifies the certificate against that DNS name instead of the
+// SNI (for servers that present a name other than the one sent as SNI, such
+// as a fronting setup). The chain is still checked against the system roots;
+// AllowInsecure turns the check off, as it does for the normal verification.
 type TLS struct {
 	Inner         Dialer
 	ServerName    string // SNI; empty => host of addr
@@ -50,6 +54,7 @@ type TLS struct {
 	MinVersion    uint16
 	Fingerprint   string
 	PinSHA256     []string // hex, ":" separators allowed
+	VerifyName    string   // verify the certificate for this name instead of the SNI
 }
 
 var fingerprints = map[string]utls.ClientHelloID{
@@ -103,6 +108,37 @@ func pinVerifier(pins []string) func([][]byte, [][]*x509.Certificate) error {
 	}
 }
 
+// nameVerifier returns a VerifyPeerCertificate hook that checks the server's
+// chain against the system roots for name (not the SNI), then runs next (the
+// pin check) when it is not nil. It is used together with
+// InsecureSkipVerify, which only switches off the built-in check.
+func nameVerifier(name string, next func([][]byte, [][]*x509.Certificate) error) func([][]byte, [][]*x509.Certificate) error {
+	return func(raw [][]byte, chains [][]*x509.Certificate) error {
+		if len(raw) == 0 {
+			return errors.New("tls: the server sent no certificate")
+		}
+		certs := make([]*x509.Certificate, 0, len(raw))
+		for _, r := range raw {
+			c, err := x509.ParseCertificate(r)
+			if err != nil {
+				return fmt.Errorf("tls: bad server certificate: %w", err)
+			}
+			certs = append(certs, c)
+		}
+		inter := x509.NewCertPool()
+		for _, c := range certs[1:] {
+			inter.AddCert(c)
+		}
+		if _, err := certs[0].Verify(x509.VerifyOptions{DNSName: name, Intermediates: inter}); err != nil {
+			return fmt.Errorf("tls: the certificate does not verify for %q: %w", name, err)
+		}
+		if next != nil {
+			return next(raw, chains)
+		}
+		return nil
+	}
+}
+
 func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
 	c, err := d.Inner.DialContext(ctx, network, addr)
 	if err != nil {
@@ -114,8 +150,15 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 		sni = host
 	}
 	pin := pinVerifier(d.PinSHA256)
+	skip := d.AllowInsecure
+	if d.VerifyName != "" && !d.AllowInsecure {
+		// The built-in check would use the SNI, so it is replaced by one that
+		// uses VerifyName (and still runs the pin check afterwards).
+		skip = true
+		pin = nameVerifier(d.VerifyName, pin)
+	}
 	if id, ok := fingerprints[strings.ToLower(d.Fingerprint)]; ok {
-		uc := utls.UClient(c, &utls.Config{ServerName: sni, InsecureSkipVerify: d.AllowInsecure,
+		uc := utls.UClient(c, &utls.Config{ServerName: sni, InsecureSkipVerify: skip,
 			NextProtos: d.ALPN, VerifyPeerCertificate: pin}, id)
 		if err := uc.BuildHandshakeState(); err != nil {
 			c.Close()
@@ -149,7 +192,7 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 	tc := tls.Client(c, &tls.Config{
 		ServerName:            sni,
 		NextProtos:            d.ALPN,
-		InsecureSkipVerify:    d.AllowInsecure,
+		InsecureSkipVerify:    skip,
 		MinVersion:            d.MinVersion,
 		VerifyPeerCertificate: pin,
 	})
