@@ -56,8 +56,13 @@ type XHTTP struct {
 
 const chromeUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36"
 
-func (d *XHTTP) setup() error {
+// setup runs once. The default server address is set here, inside the Once,
+// because concurrent dials would otherwise write d.Server at the same time.
+func (d *XHTTP) setup(addr string) error {
 	d.once.Do(func() {
+		if d.Server == "" {
+			d.Server = addr
+		}
 		h2 := true
 		switch {
 		case !d.TLS:
@@ -194,10 +199,7 @@ func (a xAddr) Network() string { return "tcp" }
 func (a xAddr) String() string  { return string(a) }
 
 func (d *XHTTP) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
-	if d.Server == "" {
-		d.Server = addr
-	}
-	if err := d.setup(); err != nil {
+	if err := d.setup(addr); err != nil {
 		return nil, err
 	}
 	base := d.baseURL()
