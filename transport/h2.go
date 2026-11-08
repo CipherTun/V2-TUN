@@ -138,6 +138,9 @@ type GRPC struct {
 	TLS     bool
 	Host    string
 	Service string // default "GunService"
+	// Multi selects Xray's multiMode: the "TunMulti" method, whose messages
+	// carry a list of hunks instead of one. The server must use the same mode.
+	Multi bool
 }
 
 func (d *GRPC) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -153,18 +156,55 @@ func (d *GRPC) DialContext(ctx context.Context, network, addr string) (net.Conn,
 	if svc == "" {
 		svc = "GunService"
 	}
-	s, err := openH2(ctx, raw, d.TLS, host, "/"+svc+"/Tun", map[string]string{
+	method := "Tun"
+	if d.Multi {
+		method = "TunMulti"
+	}
+	s, err := openH2(ctx, raw, d.TLS, host, "/"+svc+"/"+method, map[string]string{
 		"Content-Type": "application/grpc", "Te": "trailers", "User-Agent": "grpc-go/1.58.1"})
 	if err != nil {
 		return nil, err
 	}
-	return &gunConn{Conn: s, br: bufio.NewReader(s)}, nil
+	return &gunConn{Conn: s, br: bufio.NewReader(s), multi: d.Multi}, nil
 }
 
 type gunConn struct {
 	net.Conn
-	br   *bufio.Reader
-	rbuf []byte
+	br    *bufio.Reader
+	rbuf  []byte
+	multi bool
+}
+
+// hunk encodes the protobuf message Hunk{data}: field 1, length-delimited.
+func hunk(data []byte) []byte {
+	b := append([]byte{0x0a}, binary.AppendUvarint(nil, uint64(len(data)))...)
+	return append(b, data...)
+}
+
+// parseHunks returns the payload of a Hunk message, or, when multi is set, of
+// every Hunk inside a MultiHunk message (field 1, repeated), concatenated.
+func parseHunks(msg []byte, multi bool) ([]byte, error) {
+	var out []byte
+	for len(msg) > 0 {
+		if msg[0] != 0x0a {
+			return nil, errors.New("grpc: unexpected hunk")
+		}
+		l, k := binary.Uvarint(msg[1:])
+		if k <= 0 || uint64(len(msg)-1-k) < l {
+			return nil, errors.New("grpc: bad hunk")
+		}
+		body := msg[1+k : 1+k+int(l)]
+		msg = msg[1+k+int(l):]
+		if !multi {
+			return body, nil // like before: bytes after the first hunk are ignored
+		}
+		inner, err := parseHunks(body, false)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, inner...)
+	}
+	return out, nil
 }
 
 func (c *gunConn) Write(p []byte) (int, error) {
@@ -174,8 +214,10 @@ func (c *gunConn) Write(p []byte) (int, error) {
 		if n > 16384 {
 			n = 16384
 		}
-		msg := append([]byte{0x0a}, binary.AppendUvarint(nil, uint64(n))...)
-		msg = append(msg, p[:n]...)
+		msg := hunk(p[:n])
+		if c.multi {
+			msg = hunk(msg) // MultiHunk{data: [Hunk]} has the same wire shape one level up
+		}
 		frame := append([]byte{0}, binary.BigEndian.AppendUint32(nil, uint32(len(msg)))...)
 		frame = append(frame, msg...)
 		if _, err := c.Conn.Write(frame); err != nil {
@@ -204,14 +246,11 @@ func (c *gunConn) Read(p []byte) (int, error) {
 		if len(msg) == 0 {
 			continue
 		}
-		if msg[0] != 0x0a {
-			return 0, errors.New("grpc: unexpected hunk")
+		data, err := parseHunks(msg, c.multi)
+		if err != nil {
+			return 0, err
 		}
-		l, k := binary.Uvarint(msg[1:])
-		if k <= 0 || uint64(len(msg)) < 1+uint64(k)+l {
-			return 0, errors.New("grpc: bad hunk")
-		}
-		c.rbuf = msg[1+k : 1+uint64(k)+l]
+		c.rbuf = data
 	}
 	n := copy(p, c.rbuf)
 	c.rbuf = c.rbuf[n:]
