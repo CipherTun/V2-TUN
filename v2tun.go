@@ -148,7 +148,7 @@ type Config struct {
 	// tls.enabled). The hysteria protocols bring their own QUIC/TLS: payload,
 	// reality, fragment and the other transports do not apply to them.
 	Protocol    string        `json:"protocol"`
-	Network     string        `json:"network"` // tcp (default)|ws|httpupgrade|h2|grpc|quic|xhttp
+	Network     string        `json:"network"` // tcp (default)|ws|httpupgrade|h2|grpc|quic|kcp|xhttp
 	GRPCService string        `json:"grpcService"`
 	XHTTPMode   string        `json:"xhttpMode"` // auto|packet-up|stream-up|stream-one
 	XHTTP       *XHTTPOptions `json:"xhttp,omitempty"`
@@ -169,6 +169,8 @@ type Config struct {
 	Reality      *RealityConfig    `json:"reality,omitempty"`
 	Hysteria     *HysteriaConfig   `json:"hysteria,omitempty"`
 	WS           WSConfig          `json:"ws"`
+	QUIC         *QUICConfig       `json:"quic,omitempty"`
+	KCP          *KCPConfig        `json:"kcp,omitempty"`
 	Payload      *PayloadConfig    `json:"payload,omitempty"`
 	Advanced     Advanced          `json:"advanced"`
 	Routing      *route.Config     `json:"routing,omitempty"`
@@ -200,6 +202,27 @@ type Config struct {
 type MuxConfig struct {
 	Enabled     bool `json:"enabled"`
 	Concurrency int  `json:"concurrency"`
+}
+
+// QUICConfig tunes the quic transport.
+type QUICConfig struct {
+	MultiStream  bool `json:"multiStream"` // reuse one QUIC connection, one stream per dial
+	KeepAliveSec int  `json:"keepAliveSec"`
+	MaxIdleSec   int  `json:"maxIdleSec"`
+}
+
+// KCPConfig tunes the kcp (mKCP) transport; zero values use Xray's defaults.
+// Header and Seed must match the server.
+type KCPConfig struct {
+	MTU              int    `json:"mtu"`              // default 1350
+	TTI              int    `json:"tti"`              // ms, default 50
+	UplinkCapacity   int    `json:"uplinkCapacity"`   // MB/s, default 5
+	DownlinkCapacity int    `json:"downlinkCapacity"` // MB/s, default 20
+	Congestion       bool   `json:"congestion"`
+	ReadBufferSize   int    `json:"readBufferSize"`  // MB, default 2
+	WriteBufferSize  int    `json:"writeBufferSize"` // MB, default 2
+	Header           string `json:"header"`          // none|srtp|utp|wechat-video|dtls|wireguard
+	Seed             string `json:"seed"`            // empty = classic auth, set = AES-GCM
 }
 
 // Client dials targets through the configured tunnel.
@@ -385,8 +408,8 @@ func buildOutbound(cfg *Config, res *net.Resolver) (proxy.Outbound, time.Duratio
 	if isHysteria && (cfg.Payload != nil || cfg.Reality != nil || cfg.Fragment != nil || (net_ != "" && net_ != "tcp")) {
 		return nil, 0, errors.New("v2tun: hysteria brings its own QUIC and TLS; payload, reality, fragment and transports do not apply")
 	}
-	if cfg.Reality != nil && net_ == "quic" {
-		return nil, 0, errors.New("v2tun: reality cannot be combined with the quic transport")
+	if cfg.Reality != nil && (net_ == "quic" || net_ == "kcp" || net_ == "mkcp") {
+		return nil, 0, errors.New("v2tun: reality cannot be combined with the quic or kcp transport")
 	}
 	tlsOn := cfg.TLS.Enabled || cfg.Reality != nil
 	alpn := cfg.TLS.ALPN
@@ -416,7 +439,7 @@ func buildOutbound(cfg *Config, res *net.Resolver) (proxy.Outbound, time.Duratio
 		d = x
 	case "grpc":
 		d = &transport.GRPC{Inner: d, TLS: tlsOn, Host: cfg.WS.Host, Service: cfg.GRPCService}
-	case "quic":
+	case "quic", "kcp", "mkcp":
 	case "ws", "websocket":
 		d = &transport.WebSocket{Inner: d, Host: cfg.WS.Host, Path: cfg.WS.Path, Headers: cfg.WS.Headers, PingSec: cfg.WS.PingSec}
 	case "httpupgrade":
@@ -734,10 +757,27 @@ func normalizeResponseMap(m map[string]int) (map[string]int, error) {
 	return out, nil
 }
 
-// baseChain builds tcp -> [payload pre] -> [record layer, Vision only] -> tls|reality -> [payload post] (or QUIC alone).
+// baseChain builds tcp -> [payload pre] -> [record layer, Vision only] -> tls|reality -> [payload post] (or QUIC / mKCP alone).
 func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *net.Resolver) (transport.Dialer, error) {
-	if net_ == "quic" { // QUIC carries its own TLS; payload and TLS layers don't apply
-		return &transport.QUIC{ServerName: cfg.TLS.SNI, ALPN: cfg.TLS.ALPN, AllowInsecure: cfg.TLS.AllowInsecure, Resolver: res}, nil
+	switch net_ {
+	case "quic": // QUIC carries its own TLS; payload and TLS layers don't apply
+		q := &transport.QUIC{ServerName: cfg.TLS.SNI, ALPN: cfg.TLS.ALPN, AllowInsecure: cfg.TLS.AllowInsecure, Resolver: res}
+		if c := cfg.QUIC; c != nil {
+			q.MultiStream = c.MultiStream
+			q.KeepAlive = time.Duration(c.KeepAliveSec) * time.Second
+			q.MaxIdle = time.Duration(c.MaxIdleSec) * time.Second
+		}
+		return q, nil
+	case "kcp", "mkcp": // UDP transport: the TLS, payload and fragment layers do not apply
+		k := &transport.KCP{Resolver: res}
+		if c := cfg.KCP; c != nil {
+			k.MTU, k.TTI = c.MTU, c.TTI
+			k.UplinkCapacity, k.DownlinkCapacity = c.UplinkCapacity, c.DownlinkCapacity
+			k.Congestion = c.Congestion
+			k.ReadBufferSize, k.WriteBufferSize = c.ReadBufferSize, c.WriteBufferSize
+			k.Header, k.Seed = c.Header, c.Seed
+		}
+		return k, nil
 	}
 	var d transport.Dialer = &transport.TCP{Timeout: to, Resolver: res}
 	if f := cfg.Fragment; f != nil {
