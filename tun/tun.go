@@ -18,6 +18,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -88,6 +89,8 @@ func Start(o Options) (*Tun, error) {
 		var wq waiter.Queue
 		e, err := r.CreateEndpoint(&wq)
 		if err != nil {
+			connFailLim.Warn(tunLog, time.Second, "could not accept a tcp connection",
+				"dst", id.LocalAddress.String(), "err", fmt.Sprint(err))
 			r.Complete(true)
 			return
 		}
@@ -106,6 +109,8 @@ func Start(o Options) (*Tun, error) {
 		var wq waiter.Queue
 		e, err := r.CreateEndpoint(&wq)
 		if err != nil {
+			udpFailLim.Warn(tunLog, time.Second, "could not accept a udp flow",
+				"dst", id.LocalAddress.String(), "err", fmt.Sprint(err))
 			return false
 		}
 		c := gonet.NewUDPConn(&wq, e)
@@ -120,17 +125,22 @@ func Start(o Options) (*Tun, error) {
 		case o.UDP != nil:
 			go relayUDP(ctx, c, dst, o)
 		default:
+			tunLog.Debug("udp flow dropped: no udp relay", "dst", dst)
 			c.Close() // no UDP support: drop
 		}
 		return true
 	})
 	s.SetTransportProtocolHandler(udp.ProtocolNumber, uf.HandlePacket)
+
+	tunLog.Info("tun stack started", "mtu", o.MTU, "dns", o.DNS, "fakeDns", o.Fake != nil,
+		"sniff", o.Sniff, "udpRelay", o.UDP != nil)
 	return t, nil
 }
 
 func (t *Tun) Close() {
 	t.cancel()
 	t.s.Close()
+	tunLog.Info("tun stack stopped")
 }
 
 // resolveDst swaps a fake address back to its domain.
@@ -172,11 +182,18 @@ func relay(ctx context.Context, local net.Conn, dst string, o Options) {
 	up, err := o.Dialer.DialContext(dctx, "tcp", dst)
 	cancel()
 	if err != nil {
+		if strings.Contains(err.Error(), "blocked by routing rule") {
+			tunLog.Debug("connection blocked by a routing rule", "dst", dst, "proto", proto)
+		} else {
+			connFailLim.Warn(tunLog, time.Second, "connection failed", "dst", dst, "proto", proto, "err", err)
+		}
 		return
 	}
+	tunLog.Debug("tcp open", "dst", dst, "proto", proto)
 	defer up.Close()
 	if len(first) > 0 {
 		if _, err := up.Write(first); err != nil {
+			tunLog.Debug("could not send the first bytes", "dst", dst, "err", err)
 			return
 		}
 	}
@@ -211,9 +228,12 @@ func serveDNS(ctx context.Context, c net.Conn, server string, o Options) {
 			}
 		}
 		go func() {
-			if resp, err := dnsOverTCP(ctx, o.Dialer, server, q); err == nil {
-				c.Write(resp)
+			resp, err := dnsOverTCP(ctx, o.Dialer, server, q)
+			if err != nil {
+				dnsFailLim.Warn(tunLog, 5*time.Second, "dns query failed", "server", server, "err", err)
+				return
 			}
+			c.Write(resp)
 		}()
 	}
 }
@@ -249,8 +269,14 @@ func relayUDP(ctx context.Context, local net.Conn, dst string, o Options) {
 	up, err := o.UDP.DialUDP(dctx, dst)
 	cancel()
 	if err != nil {
+		if strings.Contains(err.Error(), "blocked by routing rule") {
+			tunLog.Debug("udp flow blocked by a routing rule", "dst", dst)
+		} else {
+			udpFailLim.Warn(tunLog, time.Second, "udp flow failed", "dst", dst, "err", err)
+		}
 		return
 	}
+	tunLog.Debug("udp open", "dst", dst)
 	defer up.Close()
 	const idleTO = 60 * time.Second
 	idle := time.AfterFunc(idleTO, func() { local.Close(); up.Close() })

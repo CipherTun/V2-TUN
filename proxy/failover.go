@@ -17,10 +17,11 @@ type Failover struct {
 	Outs   []Outbound
 	PerTry time.Duration // limit for each outbound's attempt (default 12s)
 
-	mu   sync.Mutex
-	cur  int
-	rank []int              // latency ranking (indexes into Outs) set by StartLatencyEngine; nil => list order
-	stop context.CancelFunc // stops the latency engine
+	mu    sync.Mutex
+	cur   int
+	rank  []int              // latency ranking (indexes into Outs) set by StartLatencyEngine; nil => list order
+	alive []bool             // reachability seen by the last latency probe; nil before the first one
+	stop  context.CancelFunc // stops the latency engine
 }
 
 var (
@@ -81,10 +82,15 @@ func (f *Failover) DialContext(ctx context.Context, network, target string) (net
 		c, err := f.attempt(ctx, func(cx context.Context) (net.Conn, error) { return out.DialContext(cx, network, target) })
 		if err == nil {
 			f.mu.Lock()
+			prev := f.cur
 			f.cur = i
 			f.mu.Unlock()
+			if prev != i {
+				failLog.Warn("switched outbound", "from", prev+1, "to", i+1, "of", len(f.Outs), "why", oneLine(errors.Join(errs...)))
+			}
 			return c, nil
 		}
+		failLog.Debug("outbound attempt failed", "outbound", i+1, "target", target, "err", err)
 		errs = append(errs, fmt.Errorf("outbound %d: %w", i+1, err))
 		if ctx.Err() != nil {
 			break
@@ -93,7 +99,11 @@ func (f *Failover) DialContext(ctx context.Context, network, target string) (net
 	if len(errs) == 0 {
 		return nil, errors.New("failover: no outbounds")
 	}
-	return nil, errors.Join(errs...)
+	err := errors.Join(errs...)
+	if ctx.Err() == nil { // not just the caller giving up
+		allFailedLim.Error(failLog, time.Second, "every outbound failed", "outbounds", len(f.Outs), "target", target, "err", oneLine(err))
+	}
+	return nil, err
 }
 
 // DialUDP tries the outbounds that can relay UDP, in the same order.
@@ -108,6 +118,7 @@ func (f *Failover) DialUDP(ctx context.Context, target string) (net.Conn, error)
 		if err == nil {
 			return c, nil
 		}
+		failLog.Debug("outbound udp attempt failed", "outbound", i+1, "target", target, "err", err)
 		errs = append(errs, fmt.Errorf("outbound %d: %w", i+1, err))
 		if ctx.Err() != nil {
 			break
@@ -116,7 +127,11 @@ func (f *Failover) DialUDP(ctx context.Context, target string) (net.Conn, error)
 	if len(errs) == 0 {
 		return nil, ErrNotImplemented
 	}
-	return nil, errors.Join(errs...)
+	err := errors.Join(errs...)
+	if ctx.Err() == nil {
+		udpFailedLim.Warn(failLog, time.Second, "udp failed on every outbound", "target", target, "err", oneLine(err))
+	}
+	return nil, err
 }
 
 // Close closes every outbound that holds long-lived resources and stops the

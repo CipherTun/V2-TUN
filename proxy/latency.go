@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -42,6 +43,8 @@ func (f *Failover) StartLatencyEngine(ctx context.Context, every time.Duration, 
 	}
 	f.stop = cancel
 	f.mu.Unlock()
+
+	latLog.Info("latency engine started", "outbounds", len(f.Outs), "everySec", int(every/time.Second))
 
 	probes := append([]string(nil), addrs...)
 	go func() {
@@ -104,6 +107,39 @@ func (f *Failover) profile(ctx context.Context, addrs []string, rs *net.Resolver
 		return a.rtt < b.rtt
 	})
 	f.mu.Lock()
+	prev := f.alive
+	f.alive = make([]bool, len(res))
+	for i, r := range res {
+		f.alive[i] = r.alive
+	}
 	f.rank = idx
 	f.mu.Unlock()
+
+	var order strings.Builder
+	for k, i := range idx {
+		if k > 0 {
+			order.WriteString(" > ")
+		}
+		switch {
+		case addrs[i] == "":
+			fmt.Fprintf(&order, "%d(not probed)", i+1)
+		case !res[i].alive:
+			fmt.Fprintf(&order, "%d(down)", i+1)
+		default:
+			fmt.Fprintf(&order, "%d(%dms)", i+1, res[i].rtt.Milliseconds())
+		}
+	}
+	latLog.Debug("latency ranking", "order", order.String())
+
+	// Only changes are worth a line: a dead server would otherwise be
+	// reported at every probe.
+	for i, r := range res {
+		switch {
+		case addrs[i] == "": // cannot be probed
+		case !r.alive && (prev == nil || prev[i]):
+			latLog.Warn("server not answering", "outbound", i+1, "addr", addrs[i])
+		case r.alive && prev != nil && !prev[i]:
+			latLog.Info("server answering again", "outbound", i+1, "addr", addrs[i], "ms", r.rtt.Milliseconds())
+		}
+	}
 }

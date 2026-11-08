@@ -57,12 +57,16 @@ func Serve(ctx context.Context, l net.Listener, d Dialer) error {
 // ServeOpts is Serve with authentication and UDP ASSOCIATE support.
 func ServeOpts(ctx context.Context, l net.Listener, d Dialer, o Options) error {
 	go func() { <-ctx.Done(); l.Close() }()
+	socksLog.Info("socks5 server started", "addr", l.Addr().String(),
+		"auth", o.Username != "" || o.Password != "", "udp", o.UDP != nil)
+	defer socksLog.Info("socks5 server stopped")
 	for {
 		c, err := l.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
+			socksLog.Error("socks5 server cannot accept connections", "err", err)
 			return err
 		}
 		go handle(ctx, c, d, &o)
@@ -106,6 +110,7 @@ func authenticate(c net.Conn, o *Options) bool {
 	ok := subtle.ConstantTimeCompare(user, []byte(o.Username)) == 1 &&
 		subtle.ConstantTimeCompare(pass, []byte(o.Password)) == 1
 	if !ok {
+		authFailLim.Warn(socksLog, time.Second, "socks5 login rejected", "remote", c.RemoteAddr().String())
 		c.Write([]byte{1, 1})
 		return false
 	}
@@ -126,6 +131,7 @@ func handle(ctx context.Context, c net.Conn, d Dialer, o *Options) {
 	}
 	if o.Username != "" || o.Password != "" {
 		if bytes.IndexByte(methods, 2) < 0 {
+			socksLog.Debug("socks5 client does not offer password login", "remote", c.RemoteAddr().String())
 			c.Write([]byte{5, 0xFF})
 			return
 		}
@@ -153,11 +159,13 @@ func handle(ctx context.Context, c net.Conn, d Dialer, o *Options) {
 		connect(ctx, c, d, net.JoinHostPort(host, strconv.Itoa(int(binary.BigEndian.Uint16(pb[:])))))
 	case 3:
 		if o.UDP == nil {
+			socksLog.Debug("udp associate refused: udp is not enabled")
 			reply(c, replyCmd, nil)
 			return
 		}
 		associate(ctx, c, o.UDP)
 	default:
+		socksLog.Debug("socks5 command not supported", "cmd", r[1])
 		reply(c, replyCmd, nil)
 	}
 }
@@ -168,11 +176,15 @@ func connect(ctx context.Context, c net.Conn, d Dialer, target string) {
 		code := byte(replyHost)
 		if strings.Contains(err.Error(), "blocked by routing rule") {
 			code = replyDeny
+			socksLog.Debug("connection blocked by a routing rule", "target", target)
+		} else {
+			connFailLim.Warn(socksLog, time.Second, "connection failed", "target", target, "err", err)
 		}
 		reply(c, code, nil)
 		return
 	}
 	defer up.Close()
+	socksLog.Debug("tcp open", "target", target)
 	reply(c, replyOK, nil)
 	c.SetDeadline(time.Time{})
 	done := make(chan struct{}, 2)
@@ -187,6 +199,7 @@ func associate(ctx context.Context, c net.Conn, ud UDPDialer) {
 	lh, _, _ := net.SplitHostPort(c.LocalAddr().String())
 	pc, err := net.ListenPacket("udp", net.JoinHostPort(lh, "0"))
 	if err != nil {
+		socksLog.Warn("could not open a udp port for an association", "err", err)
 		reply(c, replyFail, nil)
 		return
 	}
@@ -197,6 +210,7 @@ func associate(ctx context.Context, c net.Conn, ud UDPDialer) {
 	if ta, ok := c.RemoteAddr().(*net.TCPAddr); ok {
 		peerIP = ta.IP.String()
 	}
+	socksLog.Debug("udp association opened", "remote", c.RemoteAddr().String())
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	go func() { // the TCP control connection defines the association's lifetime
@@ -265,12 +279,18 @@ func (a *assoc) flow(dst, host string, port int) *flow {
 	full := len(a.flows) >= maxFlows
 	a.mu.Unlock()
 	if full {
+		udpFailLim.Warn(socksLog, time.Second, "too many udp flows in one association", "max", maxFlows, "dst", dst)
 		return nil
 	}
 	dctx, cancel := context.WithTimeout(a.ctx, 15*time.Second)
 	conn, err := a.dial.DialUDP(dctx, dst)
 	cancel()
 	if err != nil {
+		if strings.Contains(err.Error(), "blocked by routing rule") {
+			socksLog.Debug("udp flow blocked by a routing rule", "dst", dst)
+		} else {
+			udpFailLim.Warn(socksLog, time.Second, "udp flow failed", "dst", dst, "err", err)
+		}
 		return nil
 	}
 	a.mu.Lock()
@@ -283,6 +303,7 @@ func (a *assoc) flow(dst, host string, port int) *flow {
 	f.idle = time.AfterFunc(udpIdle, func() { a.drop(dst) })
 	a.flows[dst] = f
 	a.mu.Unlock()
+	socksLog.Debug("udp open", "dst", dst)
 	go a.pump(f, dst, udpHeader(host, port))
 	return f
 }

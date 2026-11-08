@@ -101,6 +101,7 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 	if s.client != nil {
 		return s.client, nil
 	}
+	sshLog.Debug("ssh connecting", "server", s.Server)
 	raw, err := s.Dialer.DialContext(ctx, "tcp", s.Server)
 	if err != nil {
 		return nil, err
@@ -120,6 +121,7 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 		signer, err := ParsePrivateKey(s.PrivateKey, s.Passphrase)
 		if err != nil {
 			raw.Close()
+			sshLog.Warn("ssh private key unusable", "server", s.Server, "err", err)
 			return nil, err
 		}
 		cfg.Auth = append(cfg.Auth, ssh.PublicKeys(signer))
@@ -130,10 +132,12 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 	cc, chans, reqs, err := ssh.NewClientConn(raw, s.Server, cfg)
 	if err != nil {
 		raw.Close()
+		sshLog.Warn("ssh handshake or login failed", "server", s.Server, "user", s.User, "err", err)
 		return nil, err
 	}
 	cl := ssh.NewClient(cc, chans, reqs)
 	s.client = cl
+	sshLog.Info("ssh session established", "server", s.Server, "user", s.User, "remote", string(cc.ServerVersion()))
 	go func() { // keepalive so NAT/carriers don't drop the tunnel
 		for {
 			time.Sleep(25 * time.Second)
@@ -143,7 +147,15 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 		}
 	}()
 	go func() {
-		cl.Wait()
+		err := cl.Wait()
+		s.mu.Lock()
+		unexpected := s.client == cl // we did not drop or close it ourselves
+		s.mu.Unlock()
+		if unexpected {
+			sshLog.Warn("ssh session lost", "server", s.Server, "err", err)
+		} else {
+			sshLog.Debug("ssh session closed", "server", s.Server)
+		}
 		s.drop(cl)
 	}()
 	return cl, nil
@@ -209,10 +221,15 @@ func (s *SSH) DialContext(ctx context.Context, network, target string) (net.Conn
 		}
 		// The target refusing the connection says nothing about the session.
 		var refused *ssh.OpenChannelError
-		if errors.As(err, &refused) || attempt > 0 || ctx.Err() != nil {
+		if errors.As(err, &refused) {
+			sshLog.Debug("ssh server refused the target", "target", target, "err", err)
+			return nil, err
+		}
+		if attempt > 0 || ctx.Err() != nil {
 			return nil, err
 		}
 		// The session may have died since its last use: reconnect once.
+		sshLog.Info("ssh session looks dead, reconnecting", "server", s.Server, "err", err)
 		s.drop(cl)
 	}
 }
