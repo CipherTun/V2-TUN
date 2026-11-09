@@ -14,12 +14,12 @@ import (
 
 var checkLog = logx.L("check")
 
-// checkTargets are well-known connectivity endpoints. Any HTTP answer from
-// one of them (200, 204, a redirect, a moved-permanently, even an error page)
-// proves that data flows through the tunnel and the far side is alive, so the
-// status and the body are not compared. Only a failure to get an answer at
-// all (dial error, timeout, reset, TLS/protocol error) counts as dead or
-// offline.
+// checkTargets are well-known connectivity endpoints. A target counts as
+// reachable when, after following any redirects (301, 302, ...), the final
+// answer is a success (2xx such as 200 or 204) or a redirect that cannot be
+// followed further. Any 4xx or 5xx answer, and any failure to get an answer
+// at all (dial error, timeout, reset, TLS error, too many redirects), counts
+// as dead or offline.
 var checkTargets = []string{
 	"http://cp.cloudflare.com/generate_204",
 	"http://connectivitycheck.gstatic.com/generate_204",
@@ -33,8 +33,9 @@ var checkTargets = []string{
 // tunnel look healthy. The request does not count as tunnel traffic and does
 // not show in Connections.
 //
-// It succeeds when any one of the targets answers with any HTTP response, and
-// fails with the reason of every attempt otherwise. ctx limits the whole check.
+// It succeeds when any one of the targets answers acceptably (see
+// checkTargets), and fails with the reason of every attempt otherwise. ctx
+// limits the whole check.
 func (c *Client) CheckTunnel(ctx context.Context) (time.Duration, error) {
 	var why []string
 	for _, u := range checkTargets {
@@ -59,6 +60,8 @@ func (c *Client) CheckTunnel(ctx context.Context) (time.Duration, error) {
 func (c *Client) checkOne(ctx context.Context, url string) (time.Duration, error) {
 	cx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
+	// redirects (301, 302, 303, 307, 308) are followed, up to the net/http
+	// default of 10, and every hop goes through the same outbound
 	hc := &http.Client{
 		Transport: &http.Transport{
 			DialContext: func(dctx context.Context, network, addr string) (net.Conn, error) {
@@ -66,9 +69,6 @@ func (c *Client) checkOne(ctx context.Context, url string) (time.Duration, error
 			},
 			DisableKeepAlives: true,
 		},
-		// a redirect already proves the path is alive; do not follow it, the
-		// next hop could be a portal host that is slow or unreachable
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	req, err := http.NewRequestWithContext(cx, http.MethodGet, url, nil)
 	if err != nil {
@@ -80,7 +80,9 @@ func (c *Client) checkOne(ctx context.Context, url string) (time.Duration, error
 		return 0, err
 	}
 	defer resp.Body.Close()
-	// any status counts: getting a response at all means the tunnel is up
 	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
+	if resp.StatusCode >= 400 {
+		return 0, fmt.Errorf("GET %s answered %d", url, resp.StatusCode)
+	}
 	return time.Since(t0), nil
 }
