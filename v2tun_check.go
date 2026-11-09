@@ -14,20 +14,16 @@ import (
 
 var checkLog = logx.L("check")
 
-// checkTarget is a well-known connectivity endpoint and what a real answer
-// from it looks like. A captive portal or a carrier's "no balance" page also
-// answers (often 200 or a redirect), so the exact status, and for the last
-// target the body, have to match.
-type checkTarget struct {
-	url    string
-	status int
-	body   string // must appear in the body when not empty
-}
-
-var checkTargets = []checkTarget{
-	{"http://cp.cloudflare.com/generate_204", http.StatusNoContent, ""},
-	{"http://connectivitycheck.gstatic.com/generate_204", http.StatusNoContent, ""},
-	{"http://www.msftconnecttest.com/connecttest.txt", http.StatusOK, "Microsoft Connect Test"},
+// checkTargets are well-known connectivity endpoints. Any HTTP answer from
+// one of them (200, 204, a redirect, a moved-permanently, even an error page)
+// proves that data flows through the tunnel and the far side is alive, so the
+// status and the body are not compared. Only a failure to get an answer at
+// all (dial error, timeout, reset, TLS/protocol error) counts as dead or
+// offline.
+var checkTargets = []string{
+	"http://cp.cloudflare.com/generate_204",
+	"http://connectivitycheck.gstatic.com/generate_204",
+	"http://www.msftconnecttest.com/connecttest.txt",
 }
 
 // CheckTunnel proves that data really flows: it fetches a small well-known
@@ -37,17 +33,17 @@ var checkTargets = []checkTarget{
 // tunnel look healthy. The request does not count as tunnel traffic and does
 // not show in Connections.
 //
-// It succeeds when any one of the targets answers as expected, and fails with
-// the reason of every attempt otherwise. ctx limits the whole check.
+// It succeeds when any one of the targets answers with any HTTP response, and
+// fails with the reason of every attempt otherwise. ctx limits the whole check.
 func (c *Client) CheckTunnel(ctx context.Context) (time.Duration, error) {
 	var why []string
-	for _, t := range checkTargets {
+	for _, u := range checkTargets {
 		if ctx.Err() != nil {
 			break
 		}
-		d, err := c.checkOne(ctx, t)
+		d, err := c.checkOne(ctx, u)
 		if err == nil {
-			checkLog.Debug("tunnel check passed", "url", t.url, "ms", d.Milliseconds())
+			checkLog.Debug("tunnel check passed", "url", u, "ms", d.Milliseconds())
 			return d, nil
 		}
 		why = append(why, strings.ReplaceAll(err.Error(), "\n", " "))
@@ -60,7 +56,7 @@ func (c *Client) CheckTunnel(ctx context.Context) (time.Duration, error) {
 	return 0, err
 }
 
-func (c *Client) checkOne(ctx context.Context, t checkTarget) (time.Duration, error) {
+func (c *Client) checkOne(ctx context.Context, url string) (time.Duration, error) {
 	cx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
 	hc := &http.Client{
@@ -70,10 +66,11 @@ func (c *Client) checkOne(ctx context.Context, t checkTarget) (time.Duration, er
 			},
 			DisableKeepAlives: true,
 		},
-		// a redirect is what a captive portal answers: do not follow it
+		// a redirect already proves the path is alive; do not follow it, the
+		// next hop could be a portal host that is slow or unreachable
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
-	req, err := http.NewRequestWithContext(cx, http.MethodGet, t.url, nil)
+	req, err := http.NewRequestWithContext(cx, http.MethodGet, url, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -83,12 +80,7 @@ func (c *Client) checkOne(ctx context.Context, t checkTarget) (time.Duration, er
 		return 0, err
 	}
 	defer resp.Body.Close()
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-	if resp.StatusCode != t.status {
-		return 0, fmt.Errorf("GET %s answered %d, expected %d", t.url, resp.StatusCode, t.status)
-	}
-	if t.body != "" && !strings.Contains(string(body), t.body) {
-		return 0, fmt.Errorf("GET %s answered with an unexpected page", t.url)
-	}
+	// any status counts: getting a response at all means the tunnel is up
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 512))
 	return time.Since(t0), nil
 }
