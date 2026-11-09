@@ -302,3 +302,51 @@ func TestSSHOverFramedWebSocketAuto(t *testing.T) {
 	defer cl.Close()
 	pxEcho(t, cl, "target.example:80")
 }
+
+// A real WebSocket server answers 400 to an upgrade request that lacks the
+// handshake headers. The payload leaves them out, the library adds them.
+func TestSSHWebSocketAddsHandshakeHeaders(t *testing.T) {
+	h, p := pxServeOnce(t, func(c net.Conn) {
+		hdr, err := pxReadHeaders(c)
+		if err != nil {
+			return
+		}
+		low := strings.ToLower(hdr)
+		if !strings.Contains(low, "\r\nsec-websocket-key: ") || !strings.Contains(low, "\r\nsec-websocket-version: 13\r\n") {
+			c.Write([]byte("HTTP/1.1 400 Bad Request\r\n\r\n"))
+			return
+		}
+		c.Write([]byte(ws101))
+		pxSSHServer(c)
+	})
+	cl, err := New(&Config{Protocol: "ssh", Server: h, Port: p, Username: "u", Password: "p",
+		Payload: &PayloadConfig{Template: sshWSPayload, Host: "bug.example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	pxEcho(t, cl, "target.example:80")
+}
+
+// A decoy request line in front of the upgrade request gets no reply from the
+// server. The 101 ends the reading, so the dial does not wait for a second one.
+func TestSSHWebSocketDecoyLineDoesNotStall(t *testing.T) {
+	h, p := pxServeOnce(t, func(c net.Conn) {
+		if _, err := pxReadHeaders(c); err != nil { // the decoy
+			return
+		}
+		if _, err := pxReadHeaders(c); err != nil { // the upgrade request
+			return
+		}
+		c.Write([]byte(ws101)) // one reply only
+		pxSSHServer(c)
+	})
+	tpl := "GET http://decoy.example/ HTTP/1.1[crlf]Host: decoy.example[crlf][crlf]" + sshWSPayload
+	cl, err := New(&Config{Protocol: "ssh", Server: h, Port: p, Username: "u", Password: "p",
+		Payload: &PayloadConfig{Template: tpl, Host: "bug.example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	pxEcho(t, cl, "target.example:80")
+}

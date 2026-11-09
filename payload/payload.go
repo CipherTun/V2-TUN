@@ -550,23 +550,31 @@ func Send(w io.Writer, segs []Segment) error {
 // ReadHTTPHeaders consumes a response header block (up to \r\n\r\n)
 // byte by byte so no tunnel data is swallowed, and returns the status code.
 func ReadHTTPHeaders(r io.Reader) (int, error) {
+	code, _, err := ReadHTTPReply(r)
+	return code, err
+}
+
+// ReadHTTPReply is ReadHTTPHeaders that also returns the header block as it
+// was received (status line and headers, ending with the blank line).
+func ReadHTTPReply(r io.Reader) (int, string, error) {
 	var buf []byte
 	b := make([]byte, 1)
 	for len(buf) < 16384 {
 		if _, err := io.ReadFull(r, b); err != nil {
-			return 0, err
+			return 0, "", err
 		}
 		buf = append(buf, b[0])
 		if n := len(buf); n >= 4 && string(buf[n-4:]) == "\r\n\r\n" {
 			line, _, _ := strings.Cut(string(buf), "\r\n")
 			f := strings.Fields(line)
 			if len(f) < 2 {
-				return 0, fmt.Errorf("payload: bad status line %q", line)
+				return 0, "", fmt.Errorf("payload: bad status line %q", line)
 			}
-			return strconv.Atoi(f[1])
+			code, err := strconv.Atoi(f[1])
+			return code, string(buf), err
 		}
 	}
-	return 0, fmt.Errorf("payload: response headers too large")
+	return 0, "", fmt.Errorf("payload: response headers too large")
 }
 
 // ---- helpers ----

@@ -209,9 +209,11 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 // With ExpectResponse the HTTP replies to the payload's request lines are read
 // and dropped before the protocol starts. That is what a "websocket upgrade"
 // payload for SSH needs: the server answers "101 Switching Protocols" and
-// then speaks raw SSH (no WebSocket framing), so the reply must not reach the
-// SSH client. Only the status line and headers are read; a body, if a server
-// sends one, is not skipped.
+// then carries the SSH stream, so the reply must not reach the SSH client.
+// A 101 ends HTTP on the connection, so reading stops there even when the
+// payload held more request lines (a decoy line the server never answers must
+// not stall the dial). Only the status line and headers are read; a body, if a
+// server sends one, is not skipped.
 //
 // Every reply is accepted unless its status is 400 or higher; there is nothing
 // to configure, which is how HTTP Custom, HTTP Injector and NetMod behave (a
@@ -264,21 +266,27 @@ func countRequests(segs []payload.Segment) int {
 	return n
 }
 
-func (d *Payload) readReplies(c net.Conn, segs []payload.Segment) error {
+// readReplies reads the replies to the payload's requests. A 101 ends it, since
+// nothing HTTP can follow an upgrade. accepted reports whether that 101 carried
+// a Sec-WebSocket-Accept header, which a real WebSocket handshake always has.
+func (d *Payload) readReplies(c net.Conn, segs []payload.Segment) (accepted bool, err error) {
 	n := d.Responses
 	if n <= 0 {
 		n = countRequests(segs)
 	}
 	for i := 0; i < n; i++ {
-		raw, err := payload.ReadHTTPHeaders(c)
+		code, head, err := payload.ReadHTTPReply(c)
 		if err != nil {
-			return fmt.Errorf("payload: waiting for reply %d of %d: %w", i+1, n, err)
+			return false, fmt.Errorf("payload: waiting for reply %d of %d: %w", i+1, n, err)
 		}
-		if !codeOK(raw) {
-			return fmt.Errorf("payload: reply %d of %d has status %d", i+1, n, raw)
+		if !codeOK(code) {
+			return false, fmt.Errorf("payload: reply %d of %d has status %d", i+1, n, code)
+		}
+		if code == 101 {
+			return strings.Contains(strings.ToLower(head), "\nsec-websocket-accept:"), nil
 		}
 	}
-	return nil
+	return false, nil
 }
 
 // serverIP is the address [ip] stands for: the peer of the connection, or,
@@ -327,6 +335,9 @@ func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Co
 	}
 	segs := d.Template.Render(payload.Context{Host: h, Port: port, Server: server, ServerPort: port, IP: ip,
 		SNI: d.SNI, Method: d.Method, UserAgent: d.UserAgent, Vars: d.Vars})
+	if d.AutoWS && wantsWebSocket(segs) {
+		segs = withWebSocketHeaders(segs) // a real WebSocket server answers 400 without them
+	}
 	if err := payload.SendContext(ctx, c, segs); err != nil {
 		c.Close()
 		return nil, err
@@ -336,7 +347,7 @@ func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Co
 		// after 30 seconds, whichever comes first.
 		stop := context.AfterFunc(ctx, func() { c.Close() })
 		limit := time.AfterFunc(30*time.Second, func() { c.Close() })
-		err := d.readReplies(c, segs)
+		accepted, err := d.readReplies(c, segs)
 		limit.Stop()
 		if !stop() && err == nil {
 			err = ctx.Err()
@@ -346,7 +357,7 @@ func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Co
 			return nil, err
 		}
 		if d.AutoWS && wantsWebSocket(segs) {
-			return autoWebSocket(c), nil
+			return autoWebSocket(c, accepted), nil
 		}
 	}
 	return c, nil
