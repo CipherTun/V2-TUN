@@ -228,6 +228,11 @@ type Payload struct {
 	ExpectResponse bool              // read and validate the HTTP replies before continuing
 	Responses      int               // replies to read; 0 => one per HTTP request line in the payload (1 to 4)
 
+	// AutoWS (ssh over a plain tcp stream) detects, after the server accepted
+	// a payload that asks for "Upgrade: websocket", whether the stream is
+	// plain or WebSocket-framed and handles framing itself when it is.
+	AutoWS bool
+
 	// ViaProxy says the connection below goes to a remote proxy, not to addr.
 	// [ip] and [ip_port] then name the real server (resolved with Resolver)
 	// instead of the proxy.
@@ -339,6 +344,9 @@ func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Co
 		if err != nil {
 			c.Close()
 			return nil, err
+		}
+		if d.AutoWS && wantsWebSocket(segs) {
+			return autoWebSocket(c), nil
 		}
 	}
 	return c, nil

@@ -58,7 +58,9 @@ The usual injector setup is host:port, username, password, a payload and optiona
 {"protocol":"ssh","server":"ssh.example.com","port":80,"username":"user","password":"pass",
  "payload":{"template":"GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]","host":"bug.example.com"}}
 ```
-The server answers `101 Switching Protocols` and then carries the raw SSH stream (no WebSocket framing), so the reply is read and dropped before SSH starts. That happens automatically for an HTTP-looking payload on a plain tcp stream; set `expectResponse` to `true` or `false` to override.
+The server answers `101 Switching Protocols`, so the reply is read and dropped before SSH starts. That happens automatically for an HTTP-looking payload on a plain tcp stream; set `expectResponse` to `true` or `false` to override.
+
+**Plain or framed is detected for you.** After an `Upgrade: websocket` payload is accepted, the first bytes from the server decide: the SSH banner means a plain tunnel, a WebSocket frame means a framed one, and the library then frames and unframes by itself. No path, host or mode setting is needed (a server that stays silent for 1.5 s is treated as plain). This applies to protocol `ssh` on a plain tcp stream.
 
 Through an HTTP proxy (remote proxy mode), the TCP connection goes to the proxy and the payload names your real server with `[server_host_port]`, while `[host]` keeps carrying the bug host:
 ```json

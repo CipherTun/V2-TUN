@@ -72,7 +72,9 @@ type HysteriaConfig struct {
 //
 // The server's HTTP reply to the payload is handled automatically and has no
 // settings: every status below 400 (101, 2xx, 3xx) lets the tunnel start, a
-// 4xx or 5xx reply fails it.
+// 4xx or 5xx reply fails it. For ssh, a payload with "Upgrade: websocket" also
+// detects by itself whether the stream after the reply is plain or
+// WebSocket-framed; no path, host or framing option is needed.
 type PayloadConfig struct {
 	Template  string `json:"template"` // the payload, with tags such as [host], [crlf], [server_host_port]
 	Host      string `json:"host"`     // value for [host] and [host_port] (the bug host); empty => server host. [server], [server_port] and [server_host_port] always name the real server
@@ -852,7 +854,8 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 		pd = &transport.Payload{Template: tpl, Host: p.Host, Method: p.Method,
 			UserAgent: p.UserAgent, SNI: psni, Vars: p.Vars,
 			ExpectResponse: payloadExpectsReply(net_, p),
-			Responses:      p.ExpectResponses, ViaProxy: p.Proxy != "", Resolver: res}
+			Responses:      p.ExpectResponses, ViaProxy: p.Proxy != "", Resolver: res,
+			AutoWS: strings.EqualFold(cfg.Protocol, "ssh") && (net_ == "" || net_ == "tcp")}
 	}
 	post := pd != nil && cfg.Payload.Stage == "post-tls"
 	if pd != nil && cfg.Payload.Proxy != "" {

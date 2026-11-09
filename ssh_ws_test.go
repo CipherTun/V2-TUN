@@ -213,3 +213,92 @@ func TestPresetNameRefused(t *testing.T) {
 		t.Fatal("a preset name must be rejected")
 	}
 }
+
+// srvWS is the server side of a WebSocket stream: it reads masked client
+// frames and writes unmasked frames, like a websocket-to-ssh bridge does.
+type srvWS struct {
+	net.Conn
+	rbuf []byte
+}
+
+func (s *srvWS) Read(p []byte) (int, error) {
+	for len(s.rbuf) == 0 {
+		var h [2]byte
+		if _, err := io.ReadFull(s.Conn, h[:]); err != nil {
+			return 0, err
+		}
+		n := int(h[1] & 0x7f)
+		if n == 126 {
+			var e [2]byte
+			if _, err := io.ReadFull(s.Conn, e[:]); err != nil {
+				return 0, err
+			}
+			n = int(e[0])<<8 | int(e[1])
+		} else if n == 127 {
+			return 0, errors.New("test server: frame too large")
+		}
+		var mask [4]byte
+		if h[1]&0x80 != 0 {
+			if _, err := io.ReadFull(s.Conn, mask[:]); err != nil {
+				return 0, err
+			}
+		}
+		pl := make([]byte, n)
+		if _, err := io.ReadFull(s.Conn, pl); err != nil {
+			return 0, err
+		}
+		for i := range pl {
+			pl[i] ^= mask[i%4]
+		}
+		if h[0]&0x0f == 8 {
+			return 0, io.EOF
+		}
+		if op := h[0] & 0x0f; op == 0 || op == 1 || op == 2 {
+			s.rbuf = pl
+		}
+	}
+	n := copy(p, s.rbuf)
+	s.rbuf = s.rbuf[n:]
+	return n, nil
+}
+
+func (s *srvWS) Write(p []byte) (int, error) {
+	total := 0
+	for len(p) > 0 {
+		n := len(p)
+		if n > 4096 {
+			n = 4096
+		}
+		hdr := []byte{0x82, 126, byte(n >> 8), byte(n)}
+		if n < 126 {
+			hdr = []byte{0x82, byte(n)}
+		}
+		if _, err := s.Conn.Write(append(hdr, p[:n]...)); err != nil {
+			return total, err
+		}
+		total += n
+		p = p[n:]
+	}
+	return total, nil
+}
+
+// The same payload works when the server frames the stream: after the 101 the
+// client sees a WebSocket frame instead of the SSH banner, switches to
+// framing by itself and SSH still logs in. No path, host or mode is set.
+func TestSSHOverFramedWebSocketAuto(t *testing.T) {
+	h, p := pxServeOnce(t, func(c net.Conn) {
+		if _, err := pxReadHeaders(c); err != nil {
+			return
+		}
+		c.Write([]byte(ws101))
+		pxSSHServer(&srvWS{Conn: c})
+	})
+	cl, err := New(&Config{Protocol: "ssh", Server: h, Port: p, Username: "u", Password: "p",
+		Payload: &PayloadConfig{Template: "GET /ws HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]",
+			Host: "bug.example.com"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cl.Close()
+	pxEcho(t, cl, "target.example:80")
+}
