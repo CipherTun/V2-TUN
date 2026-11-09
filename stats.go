@@ -31,7 +31,11 @@ func (c countConn) Write(p []byte) (int, error) {
 	return n, err
 }
 
-// Ping measures time to a first response (default generate_204) through the tunnel.
+// Ping measures the time to a good response (default generate_204) through
+// the tunnel. Redirects (301, 302, ...) are followed, up to the net/http
+// default of 10, and the answer at the end must be a success (2xx such as 200
+// or 204). Any 4xx or 5xx answer, and any failure to get an answer at all,
+// is an error.
 func (c *Client) Ping(ctx context.Context, rawURL string) (time.Duration, error) {
 	if rawURL == "" {
 		rawURL = "http://www.gstatic.com/generate_204"
@@ -39,7 +43,6 @@ func (c *Client) Ping(ctx context.Context, rawURL string) (time.Duration, error)
 	hc := &http.Client{
 		Transport: &http.Transport{DialContext: c.DialContext, DisableKeepAlives: true},
 		Timeout:   15 * time.Second,
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", rawURL, nil)
 	if err != nil {
@@ -51,7 +54,7 @@ func (c *Client) Ping(ctx context.Context, rawURL string) (time.Duration, error)
 		return 0, err
 	}
 	resp.Body.Close()
-	if resp.StatusCode >= 500 {
+	if resp.StatusCode >= 400 {
 		return 0, fmt.Errorf("ping: status %d", resp.StatusCode)
 	}
 	return time.Since(t0), nil
