@@ -7,6 +7,11 @@
 // replace raw IPs for routing and for the proxy server, and the sniffed
 // protocol is handed to the router (see route.WithProtocol).
 //
+// The descriptor stays owned by the caller: Start and Close never close it.
+// Close returns only after the packet reader has stopped, so the caller can
+// close the descriptor (which is what removes the VPN key from the Android
+// status bar) right after it.
+//
 // Pin gVisor with: go get gvisor.dev/gvisor@go   (its API moves; adjust
 // NewUDPConn/NewForwarder calls if your version differs).
 package tun
@@ -19,6 +24,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -44,7 +50,9 @@ type UDPDialer interface {
 }
 
 type Options struct {
-	FD     int    // from ParcelFileDescriptor.detachFd()
+	// FD is the TUN descriptor (ParcelFileDescriptor.getFd()). The caller keeps
+	// ownership and must close it after Tun.Close returns; the stack never does.
+	FD     int
 	MTU    uint32 // default 1500
 	DNS    string // "1.1.1.1:53": DNS as DNS-over-TCP through the tunnel; empty => relay as UDP
 	Dialer Dialer
@@ -55,7 +63,9 @@ type Options struct {
 
 type Tun struct {
 	s      *stack.Stack
+	nic    tcpip.NICID
 	cancel context.CancelFunc
+	once   sync.Once
 }
 
 func Start(o Options) (*Tun, error) {
@@ -82,7 +92,7 @@ func Start(o Options) (*Tun, error) {
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
-	t := &Tun{s: s, cancel: cancel}
+	t := &Tun{s: s, nic: nic, cancel: cancel}
 
 	tf := tcp.NewForwarder(s, 0, 2048, func(r *tcp.ForwarderRequest) {
 		id := r.ID()
@@ -137,10 +147,17 @@ func Start(o Options) (*Tun, error) {
 	return t, nil
 }
 
+// Close stops the stack. It removes the NIC first: that stops the goroutine
+// reading the TUN descriptor and waits for it, which Stack.Close alone does
+// not do. When Close returns nothing touches the descriptor any more, so the
+// caller can close it. Close is safe to call more than once.
 func (t *Tun) Close() {
-	t.cancel()
-	t.s.Close()
-	tunLog.Info("tun stack stopped")
+	t.once.Do(func() {
+		t.cancel()
+		t.s.RemoveNIC(t.nic)
+		t.s.Close()
+		tunLog.Info("tun stack stopped")
+	})
 }
 
 // resolveDst swaps a fake address back to its domain.
