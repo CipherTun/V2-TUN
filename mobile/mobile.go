@@ -20,6 +20,9 @@ import (
 	"io.surprise.vpn/tun"
 )
 
+// jsonUnmarshal is json.Unmarshal for a string (used by the log summary).
+func jsonUnmarshal(s string, v any) error { return json.Unmarshal([]byte(s), v) }
+
 // Protector is implemented in Kotlin: return VpnService.protect(fd).
 type Protector interface{ Protect(fd int) bool }
 
@@ -83,7 +86,12 @@ func UpdateRouting(routingJSON string) error {
 	if err := json.Unmarshal([]byte(routingJSON), &cfg); err != nil {
 		return err
 	}
-	return c.SetRouting(&cfg)
+	if err := c.SetRouting(&cfg); err != nil {
+		mlog.Warn("routing update rejected", "err", err)
+		return err
+	}
+	mlog.Info("routing updated")
+	return nil
 }
 
 // ExplainRoute reports how a connection would be routed, as JSON:
@@ -140,11 +148,14 @@ func StartTunEx(configJSON string, fd int, mtu int, dns string, fakeDNS, sniff b
 	mu.Lock()
 	defer mu.Unlock()
 	if tunInst != nil {
+		mlog.Warn("start ignored: the vpn tunnel is already running")
 		return errors.New("v2tun: tun already running")
 	}
 	if cancel != nil { // the SOCKS server owns `active`
+		mlog.Warn("start ignored: the socks server is running")
 		return errors.New("v2tun: socks server running; call Stop first")
 	}
+	mlog.Info("starting the vpn tunnel", append(summary(configJSON), "mtu", mtu, "dns", dns, "fakeDns", fakeDNS, "sniff", sniff)...)
 	c, err := newClient(configJSON)
 	if err != nil {
 		return err
@@ -159,9 +170,11 @@ func StartTunEx(configJSON string, fd int, mtu int, dns string, fakeDNS, sniff b
 	t, err := tun.Start(o)
 	if err != nil {
 		c.Close()
+		mlog.Error("could not start the tun stack", "err", err)
 		return err
 	}
 	tunInst, active = t, c
+	mlog.Info("vpn tunnel running")
 	return nil
 }
 
@@ -171,12 +184,14 @@ func StopTun() {
 	mu.Lock()
 	defer mu.Unlock()
 	if tunInst != nil {
+		mlog.Info("stopping the vpn tunnel")
 		tunInst.Close()
 		tunInst = nil
 		if active != nil {
 			active.Close()
 			active = nil
 		}
+		mlog.Info("vpn tunnel stopped")
 	}
 }
 
@@ -188,9 +203,16 @@ var (
 func newClient(configJSON string) (*v2tun.Client, error) {
 	var cfg v2tun.Config
 	if err := json.Unmarshal([]byte(configJSON), &cfg); err != nil {
+		mlog.Error("the config is not valid JSON", "err", err)
 		return nil, err
 	}
-	return v2tun.New(&cfg)
+	c, err := v2tun.New(&cfg)
+	if err != nil {
+		mlog.Error("the config cannot be used", append(describeConfig(&cfg), "err", err)...)
+		return nil, err
+	}
+	mlog.Debug("tunnel client ready", describeConfig(&cfg)...)
+	return c, nil
 }
 
 // Probe dials target (e.g. "example.com:443") through the config and closes.
@@ -202,10 +224,13 @@ func Probe(configJSON, target string) error {
 	defer c.Close() // a throwaway client must not leave an SSH session behind
 	ctx, cf := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cf()
+	t0 := time.Now()
 	conn, err := c.DialContext(ctx, "tcp", target)
 	if err != nil {
+		mlog.Warn("probe failed", "target", target, "err", err)
 		return err
 	}
+	mlog.Info("probe ok", "target", target, "ms", time.Since(t0).Milliseconds())
 	return conn.Close()
 }
 
@@ -221,11 +246,14 @@ func StartEx(configJSON, listenAddr, username, password string) error {
 	mu.Lock()
 	defer mu.Unlock()
 	if cancel != nil {
+		mlog.Warn("start ignored: the socks server is already running")
 		return errors.New("v2tun: already running")
 	}
 	if tunInst != nil { // the TUN stack owns `active`
+		mlog.Warn("start ignored: the vpn tunnel is running")
 		return errors.New("v2tun: tun running; call StopTun first")
 	}
+	mlog.Info("starting the socks server", append(summary(configJSON), "listen", listenAddr)...)
 	c, err := newClient(configJSON)
 	if err != nil {
 		return err
@@ -233,6 +261,7 @@ func StartEx(configJSON, listenAddr, username, password string) error {
 	l, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		c.Close()
+		mlog.Error("could not listen for the socks server", "listen", listenAddr, "err", err)
 		return err
 	}
 	ctx, cf := context.WithCancel(context.Background())
@@ -247,6 +276,7 @@ func Stop() {
 	mu.Lock()
 	defer mu.Unlock()
 	if cancel != nil {
+		mlog.Info("stopping the socks server")
 		cancel()
 		cancel = nil
 		if active != nil {
@@ -261,6 +291,7 @@ func Stop() {
 func ParseLink(link string) (string, error) {
 	cfg, name, err := v2tun.ParseLink(link)
 	if err != nil {
+		mlog.Warn("share link could not be parsed", "err", err)
 		return "", err
 	}
 	b, err := json.Marshal(struct {
@@ -278,6 +309,11 @@ func Ping(configJSON, url string) (int64, error) {
 	}
 	defer c.Close()
 	d, err := c.Ping(context.Background(), url)
+	if err != nil {
+		mlog.Warn("ping failed", "url", url, "err", err)
+	} else {
+		mlog.Info("ping ok", "url", url, "ms", d.Milliseconds())
+	}
 	return d.Milliseconds(), err
 }
 

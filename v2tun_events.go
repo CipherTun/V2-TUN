@@ -6,9 +6,10 @@ import (
 )
 
 // Faults are actionable errors (a dial that failed on every outbound, for
-// example) pushed to the app, separate from the log. Register a handler with
-// SetFaultHandler; the handler runs on its own goroutine, never on the dial
-// path. Repeats of the same message within 10 seconds, and anything more
+// example) pushed to the app, separate from the log; every fault that gets
+// through is also written to the log (component "fault"). Register a handler
+// with SetFaultHandler; the handler runs on its own goroutine, never on the
+// dial path. Repeats of the same message within 10 seconds, and anything more
 // often than once a second, are dropped so a dead network does not flood the
 // app.
 var faults struct {
@@ -34,12 +35,15 @@ func reportFault(err error) {
 	now := time.Now()
 	faults.mu.Lock()
 	fn := faults.fn
-	if fn == nil || now.Sub(faults.lastAt) < time.Second ||
+	if now.Sub(faults.lastAt) < time.Second ||
 		(msg == faults.last && now.Sub(faults.sameAt) < 10*time.Second) {
 		faults.mu.Unlock()
 		return
 	}
 	faults.last, faults.lastAt, faults.sameAt = msg, now, now
 	faults.mu.Unlock()
-	go fn(msg)
+	faultLog.Warn(msg)
+	if fn != nil {
+		go fn(msg)
+	}
 }

@@ -69,6 +69,8 @@ func (c *trackedConn) Close() error {
 		c.t.mu.Lock()
 		delete(c.t.m, c.id)
 		c.t.mu.Unlock()
+		connLog.Debug("connection closed", "id", c.id, "net", c.network, "target", c.target, "via", c.via,
+			"ms", time.Since(c.started).Milliseconds(), "up", c.up.Load(), "down", c.down.Load())
 	})
 	return c.Conn.Close()
 }
