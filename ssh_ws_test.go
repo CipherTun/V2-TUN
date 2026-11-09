@@ -17,6 +17,12 @@ import (
 
 const ws101 = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
 
+// There are no payload presets: tests write their payloads out.
+const (
+	sshWSPayload   = "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]"
+	connectPayload = "CONNECT [host_port] [protocol][crlf]Host: [host][crlf]Proxy-Connection: Keep-Alive[crlf][crlf]"
+)
+
 // SSH over WebSocket, the way HTTP-injector apps do it: no TLS, a plain
 // upgrade request as the payload, a 101 reply that must not reach the
 // protocol, then the raw stream.
@@ -34,7 +40,7 @@ func TestSSHWebSocketPayloadDirect(t *testing.T) {
 	})
 	// socks5 stands in for ssh here: the payload layer does not care what follows
 	cl, err := New(&Config{Protocol: "socks5", Server: h, Port: p,
-		Payload: &PayloadConfig{Template: "@ssh-ws", Host: "bug.example.com"}})
+		Payload: &PayloadConfig{Template: sshWSPayload, Host: "bug.example.com"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -94,7 +100,7 @@ func TestSSHOverWebSocketPayload(t *testing.T) {
 		pxSSHServer(c) // raw SSH right after the 101, no WebSocket framing
 	})
 	cl, err := New(&Config{Protocol: "ssh", Server: h, Port: p, Username: "u", Password: "p",
-		Payload: &PayloadConfig{Template: "@ssh-ws", Host: "bug.example.com"}})
+		Payload: &PayloadConfig{Template: sshWSPayload, Host: "bug.example.com"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -137,46 +143,73 @@ func TestSSHWebSocketViaProxyTwoReplies(t *testing.T) {
 	}
 }
 
-// The response changer: "301 Moved Permanently" counts as "200 OK".
-func TestResponseMapTurns301IntoSuccess(t *testing.T) {
-	client := func(m map[string]int) *Client {
+// Replies are judged automatically: everything below 400 lets the tunnel
+// start (101, 2xx, 3xx), 4xx and 5xx do not. There is nothing to configure.
+func TestReplyStatusRule(t *testing.T) {
+	serve := func(status string) *Client {
 		h, p := pxServeOnce(t, func(c net.Conn) {
 			if _, err := pxReadHeaders(c); err != nil {
 				return
 			}
-			c.Write([]byte("HTTP/1.1 301 Moved Permanently\r\nLocation: http://example.com/\r\n\r\n"))
+			c.Write([]byte("HTTP/1.1 " + status + "\r\nLocation: http://example.com/\r\n\r\n"))
 			pxSocks5(c, "", "")
 		})
-		cl, err := New(&Config{Protocol: "socks5", Server: h, Port: p,
-			Payload: &PayloadConfig{Template: "@ssh-ws", ResponseMap: m}})
+		cl, err := New(&Config{Protocol: "socks5", Server: h, Port: p, Payload: &PayloadConfig{Template: sshWSPayload}})
 		if err != nil {
 			t.Fatal(err)
 		}
 		return cl
 	}
-
-	// without a map the 301 is refused
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	if _, err := client(nil).DialContext(ctx, "tcp", "target.example:80"); err == nil {
-		t.Fatal("a 301 reply must fail without a responseMap")
+	for _, ok := range []string{"101 Switching Protocols", "200 OK", "204 No Content", "301 Moved Permanently", "302 Found", "307 Temporary Redirect", "399 Custom"} {
+		t.Run("accept "+ok, func(t *testing.T) { pxEcho(t, serve(ok), "target.example:80") })
 	}
-	pxEcho(t, client(map[string]int{"301": 200}), "target.example:80")
-	pxEcho(t, client(map[string]int{"3xx": 200}), "target.example:80")
+	for _, bad := range []string{"400 Bad Request", "403 Forbidden", "404 Not Found", "407 Proxy Authentication Required", "502 Bad Gateway"} {
+		t.Run("refuse "+bad, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if _, err := serve(bad).DialContext(ctx, "tcp", "target.example:80"); err == nil {
+				t.Fatalf("a %s reply must fail", bad)
+			}
+		})
+	}
 }
 
-func TestResponseMapValidation(t *testing.T) {
-	bad := []map[string]int{{"abc": 200}, {"301": 99}, {"7xx": 200}, {"30": 200}, {"301": 700}}
-	for _, m := range bad {
-		_, err := New(&Config{Protocol: "socks5", Server: "example.com", Port: 80,
-			Payload: &PayloadConfig{Template: "@ssh-ws", ResponseMap: m}})
-		if err == nil {
-			t.Errorf("responseMap %v must be rejected", m)
+// [host] is the bug host, [server_host_port] and [ip_port] always the real
+// target, also behind a remote proxy (where the socket peer is the proxy).
+func TestServerTagsViaProxy(t *testing.T) {
+	got := make(chan string, 1)
+	ph, pp := pxServeOnce(t, func(c net.Conn) {
+		hdr, err := pxReadHeaders(c)
+		if err != nil {
+			return
+		}
+		got <- hdr
+		c.Write([]byte("HTTP/1.1 200 Connection established\r\n\r\n"))
+		pxSocks5(c, "", "")
+	})
+	cl, err := New(&Config{Protocol: "socks5", Server: "127.0.0.1", Port: 80, Payload: &PayloadConfig{
+		Template: "CONNECT [server_host_port] HTTP/1.1[crlf]Host: [host][crlf]X-Server: [server]:[server_port][crlf]X-Ip: [ip_port][crlf][crlf]",
+		Host:     "bug.example.com",
+		Proxy:    net.JoinHostPort(ph, strconv.Itoa(pp)),
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pxEcho(t, cl, "target.example:80")
+	hdr := <-got
+	for _, want := range []string{"CONNECT 127.0.0.1:80 HTTP/1.1\r\n", "Host: bug.example.com\r\n",
+		"X-Server: 127.0.0.1:80\r\n", "X-Ip: 127.0.0.1:80\r\n"} {
+		if !strings.Contains(hdr, want) {
+			t.Errorf("request lacks %q:\n%q", want, hdr)
 		}
 	}
-	_, err := New(&Config{Protocol: "socks5", Server: "example.com", Port: 80,
-		Payload: &PayloadConfig{Template: "@ssh-ws", ResponseMap: map[string]int{"301": 200, "4XX": 200}}})
-	if err != nil {
-		t.Fatalf("a valid responseMap was rejected: %v", err)
+}
+
+// A payload that is still a preset name is refused instead of being sent as
+// the literal text "@ssh-ws".
+func TestPresetNameRefused(t *testing.T) {
+	if _, err := New(&Config{Protocol: "socks5", Server: "example.com", Port: 80,
+		Payload: &PayloadConfig{Template: "@ssh-ws"}}); err == nil {
+		t.Fatal("a preset name must be rejected")
 	}
 }

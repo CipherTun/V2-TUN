@@ -53,50 +53,39 @@ Share links: `socks5://user:pass@host:1080`, `socks4://host:1080`, `http://user:
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
 ## 🔌 SSH over WebSocket (payload, no TLS needed)
-The usual injector setup is host:port, username, password, a payload and optionally an HTTP proxy. TLS is the user's choice (`tls.enabled`), never required:
+The usual injector setup is host:port, username, password, a payload and optionally an HTTP proxy. TLS is the user's choice (`tls.enabled`), never required. There are **no payload presets**: you write the payload yourself.
 ```json
 {"protocol":"ssh","server":"ssh.example.com","port":80,"username":"user","password":"pass",
- "payload":{"template":"@ssh-ws","host":"bug.example.com"}}
+ "payload":{"template":"GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]","host":"bug.example.com"}}
 ```
-The `@ssh-ws` preset is `GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]`. The server answers `101 Switching Protocols` and then carries the raw SSH stream (no WebSocket framing), so the reply is read and dropped before SSH starts. That happens automatically for an HTTP-looking payload on a plain tcp stream; set `expectResponse` to `true` or `false` to override.
+The server answers `101 Switching Protocols` and then carries the raw SSH stream (no WebSocket framing), so the reply is read and dropped before SSH starts. That happens automatically for an HTTP-looking payload on a plain tcp stream; set `expectResponse` to `true` or `false` to override.
 
-> [!TIP]
-> Fronts that only let `CONNECT` through want the other variant: `@ssh-ws/tcp` (and its twin `@ssh-ws/udp`) sends `CONNECT [host_port]` with the same upgrade headers.
-
-Through an HTTP proxy (remote proxy mode), the TCP connection goes to the proxy and the payload names your real server in `[host_port]`:
+Through an HTTP proxy (remote proxy mode), the TCP connection goes to the proxy and the payload names your real server with `[server_host_port]`, while `[host]` keeps carrying the bug host:
 ```json
 {"protocol":"ssh","server":"ssh.example.com","port":22,"username":"user","password":"pass",
- "payload":{"template":"CONNECT [host_port] HTTP/1.1[crlf][crlf]GET / HTTP/1.1[crlf]Host: bug.example.com[crlf]Upgrade: websocket[crlf][crlf]","proxy":"1.2.3.4:8080"}}
+ "payload":{"template":"CONNECT [server_host_port] HTTP/1.1[crlf]Host: [host][crlf][crlf]GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]","host":"bug.example.com","proxy":"1.2.3.4:8080"}}
 ```
-One reply is read per HTTP request line in the payload (here two: the proxy's 200, then the server's 101); `expectResponses` overrides the count. Leave `host` empty when the template uses `[host_port]` for the real server, and write the bug host into the template.
+One reply is read per HTTP request line in the payload (here two: the proxy's reply, then the server's 101); `expectResponses` overrides the count.
 
-### Response changer
-`responseMap` changes the status the payload layer sees before it decides whether the reply is acceptable. Keys are a status code or a class, values are the code to treat it as:
-```json
-"payload": {"template": "@ssh-ws", "responseMap": {"301": 200, "3xx": 200}}
-```
-Without a map, `101` and any `2xx` are accepted; `expectCodes` replaces that list (`0` accepts anything). With the map above a `301 Moved Permanently` works like `200 OK`; exact codes win over classes. Only the status line and headers of a reply are read, so a server that sends a body with its fake status should be avoided. The map applies to the payload layer, not to the http/https proxy protocol.
+With `"network":"ws"` (or `httpupgrade`) the order is **proxy, payload, WebSocket, SSH**: the TCP connection goes to the remote proxy, the payload is sent and answered, then the WebSocket handshake runs on top and SSH runs inside it.
+
+### Target tags
+`[host]` / `[host_port]` / `[netData]` use the payload `host` (the bug host) when one is set. `[server]`, `[server_port]` and `[server_host_port]` always mean the real server from the config, and `[ip]` / `[ip_port]` are the real server's resolved address, also behind a remote proxy (where the socket itself connects to the proxy). Existing payloads keep working: `[host_port]` still means the same as before.
+
+### Replies are checked automatically
+There is no response changer to configure. Like HTTP Custom, HTTP Injector and NetMod, the payload layer accepts every reply below 400 (`101`, any `2xx`, any `3xx`) and refuses `4xx` and `5xx`. Only the status line and headers of a reply are read, so a server that sends a body with its fake status should be avoided. The old `responseMap` and `expectCodes` settings are gone; a config that still has them loads, and they are ignored.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
 ## 🧪 Payload (HTTP Injector style)
-`"payload": {"template": "@connect", "host": "bug.example.com", "stage": "pre-tls", "expectResponse": true, "expectResponses": 1, "expectCodes": [200], "responseMap": {"301": 200}, "vars": {"token": "abc"}, "proxy": "1.2.3.4:8080"}`
-- `template`: any template (tags are listed at the top of `payload/payload.go`: `[crlf]`, `[host_port]`, `[netData]`, `[split]`, `[delay=500]`, `[random=a|b]`, `[rotate=a|b]`, `[var=token]`, `[b64=...]`, `[rand_ua]`, ...; `[ssh]` is `[host_port]` and `[real_raw]` is `[raw]`) or a preset from the table below.
+`"payload": {"template": "CONNECT [server_host_port] HTTP/1.1[crlf]Host: [host][crlf][crlf]", "host": "bug.example.com", "stage": "pre-tls", "expectResponse": true, "expectResponses": 1, "vars": {"token": "abc"}, "proxy": "1.2.3.4:8080"}`
+- `template`: the payload, written by you (tags are listed at the top of `payload/payload.go`: `[crlf]`, `[host_port]`, `[server_host_port]`, `[netData]`, `[split]`, `[delay=500]`, `[random=a|b]`, `[rotate=a|b]`, `[var=token]`, `[b64=...]`, `[rand_ua]`, ...; `[ssh]` is `[host_port]` and `[real_raw]` is `[raw]`). A bare preset name such as `@connect` is rejected.
 - `stage`: `pre-tls` (default) sends the payload right after the TCP connect; `post-tls` sends it inside TLS.
 - `proxy`: remote proxy mode (see above). Pre-tls only.
-- `expectResponse`, `expectResponses`, `expectCodes`, `responseMap`: how the server's HTTP reply is handled (see above).
+- `expectResponse`, `expectResponses`: whether and how many HTTP replies are read before the protocol starts (see above). The status of a reply is never configurable: below 400 passes.
 - `host`, `method`, `userAgent`, `vars` fill `[host]`, `[method]`, `[ua]` and `[var=name]`; `[sni]` takes the TLS/REALITY server name.
 
-| preset | sends |
-| --- | --- |
-| `@connect`, `@split-connect` | `CONNECT host:port` (the split variant breaks the request into separate TCP segments) |
-| `@get`, `@head`, `@post` | `GET / `, `HEAD / `, `POST / ` with `Host` and `User-Agent` |
-| `@get-proxy`, `@head-proxy`, `@post-proxy` | the same with an absolute URI (`GET http://host/`), as sent to an HTTP proxy |
-| `@websocket` | `GET /` with `Upgrade: websocket` and a random `Sec-WebSocket-Key` |
-| `@ssh-ws` | `GET /` with `Upgrade: websocket`, plain text, no key |
-| `@ssh-ws/tcp`, `@ssh-ws/udp` | `CONNECT host:port` with `Upgrade: websocket` (both names are the same payload) |
-
-Preview any template without connecting: `v2tun payload -c config.json` or `mobile.PreviewPayload(template, host, port)`.
+Preview any template without connecting: `v2tun payload -c config.json` or `mobile.PreviewPayload(template, host, server, port)`.
 
 <img src="docs/assets/divider.svg" alt="" width="100%">
 
@@ -218,7 +207,7 @@ All functions live in package `mobile` and take strings and numbers only.
 | --- | --- |
 | run | `Start`, `StartEx` (SOCKS5 with optional auth), `Stop`, `StartTun`, `StartTunEx`, `StopTun`, `SetProtector` |
 | configs and links | `ParseLink`, `Validate`, `Probe`, `Ping`, `SpeedTest`, `ScanHosts` |
-| payload | `ValidatePayload`, `PreviewPayload`, `PayloadPreview`, `PayloadPresets` |
+| payload | `ValidatePayload`, `PreviewPayload`, `PayloadPreview` |
 | routing | `SetRouteList`, `SetRouteLists`, `UpdateRouting`, `ExplainRoute` |
 | state | `ActiveOutbound`, `TrafficUp`, `TrafficDown`, `ResetTraffic` |
 

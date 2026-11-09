@@ -59,7 +59,7 @@ func TestHysteriaConfigs(t *testing.T) {
 		}
 	}
 	cases := map[string]*Config{
-		"payload": {Protocol: "hysteria2", Server: "example.com", Port: 443, Payload: &PayloadConfig{Template: "@connect"}},
+		"payload": {Protocol: "hysteria2", Server: "example.com", Port: 443, Payload: &PayloadConfig{Template: connectPayload}},
 		"network": {Protocol: "hysteria2", Server: "example.com", Port: 443, Network: "ws"},
 		"reality": {Protocol: "hysteria", Server: "example.com", Port: 443, Reality: &RealityConfig{PublicKey: "x"}},
 	}

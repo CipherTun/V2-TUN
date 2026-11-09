@@ -245,7 +245,7 @@ func TestPayloadRemoteProxy(t *testing.T) {
 	})
 	cl, err := New(&Config{
 		Protocol: "socks5", Server: "origin.example", Port: 1080,
-		Payload: &PayloadConfig{Template: "@connect", Proxy: net.JoinHostPort(ph, strconv.Itoa(pp))},
+		Payload: &PayloadConfig{Template: connectPayload, Proxy: net.JoinHostPort(ph, strconv.Itoa(pp))},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -260,7 +260,7 @@ func TestPayloadProxyNeedsPreTLS(t *testing.T) {
 	_, err := New(&Config{
 		Protocol: "socks5", Server: "origin.example", Port: 1080,
 		TLS:     TLSConfig{Enabled: true},
-		Payload: &PayloadConfig{Template: "@connect", Proxy: "127.0.0.1:8080", Stage: "post-tls"},
+		Payload: &PayloadConfig{Template: connectPayload, Proxy: "127.0.0.1:8080", Stage: "post-tls"},
 	})
 	if err == nil {
 		t.Fatal("a payload proxy with the post-tls stage must be rejected")

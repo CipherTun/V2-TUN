@@ -21,10 +21,10 @@ first next time. Use it for a second server, another bug host or payload, or
 another protocol:
 ```json
 {"protocol":"ssh","server":"a.example.com","port":80,"username":"u","password":"p",
- "payload":{"template":"@ssh-ws","host":"bug1.example.com"},
+ "payload":{"template":"GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]","host":"bug1.example.com"},
  "failoverTimeoutSec":10,
  "backups":[
-   {"protocol":"ssh","server":"a.example.com","port":80,"username":"u","password":"p","payload":{"template":"@ssh-ws","host":"bug2.example.com"}},
+   {"protocol":"ssh","server":"a.example.com","port":80,"username":"u","password":"p","payload":{"template":"GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]","host":"bug2.example.com"}},
    {"protocol":"hysteria2","server":"b.example.com","port":443,"password":"secret"}
  ]}
 ```
@@ -47,8 +47,8 @@ servers that rate-limit logins.
 `v2tun payload` and `mobile.PayloadPreview` render the payload of a config
 exactly as it would be sent: where the TCP connection goes, each segment with its
 escapes visible and the pause after it, and whether and how the HTTP replies are
-checked (count, accepted codes, response changer). Nothing is sent.
-`mobile.PreviewPayload(template, host, port)` renders just a template, without a
+checked (count; every status below 400 is accepted). Nothing is sent.
+`mobile.PreviewPayload(template, host, server, port)` renders just a template, without a
 config.
 
 ## SSH host-key pinning

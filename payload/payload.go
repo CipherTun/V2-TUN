@@ -12,13 +12,17 @@
 //
 // Target and request values
 //
-//	[host]                 payload host if set, else the server host
-//	[port] [host_port]     server port, host:port (IPv6 gets brackets)
-//	[ip] [ip_port]         resolved server address of this connection
+//	[host]                 payload host (bug host) if set, else the server host
+//	[port] [host_port]     server port, [host]:port (IPv6 gets brackets)
+//	[server]               the real server host, never replaced by the payload host
+//	[server_port]          the real server port
+//	[server_host_port]     the real server host:port (IPv6 gets brackets)
+//	[ip] [ip_port]         resolved address of the real server (also behind a
+//	                       remote proxy, where the connection itself goes to the proxy)
 //	[sni]                  TLS SNI (falls back to [host])
 //	[method] [protocol]    configured method (default GET), HTTP/1.1
 //	[get] [post] [put] [head] [options] [delete] [patch] [connect] [trace]
-//	[netData] [raw] [realData]   request line: "<method|CONNECT> host:port HTTP/1.1"
+//	[netData] [raw] [realData]   request line: "<method|CONNECT> [host_port] HTTP/1.1"
 //	[ua]                   configured User-Agent (a mobile Chrome one by default)
 //	[rand_ua]              random browser User-Agent per connection
 //	[ws_key]               random Sec-WebSocket-Key
@@ -52,8 +56,11 @@
 //
 //	[repeat=N]text[/repeat]   repeat text N times (N <= 1000, blocks may nest)
 //
-// Presets: a template that is exactly one of @connect, @get, @head, @post,
-// @websocket, @split-connect expands to a ready-made payload (see PresetNames).
+// There are no built-in presets: the payload is exactly what the user writes.
+// [host] is the bug host when one is set; use [server], [server_port] or
+// [server_host_port] where the request must name the real SSH/proxy target
+// (for example "CONNECT [server_host_port] HTTP/1.1" through a remote proxy
+// while "Host: [host]" carries the bug host).
 package payload
 
 import (
@@ -67,7 +74,6 @@ import (
 	mrand "math/rand"
 	"net"
 	"net/url"
-	"sort"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -92,35 +98,18 @@ var userAgents = []string{
 	"okhttp/4.12.0",
 }
 
-var presets = map[string]string{
-	"@connect":       "CONNECT [host_port] [protocol][crlf]Host: [host][crlf]Proxy-Connection: Keep-Alive[crlf][crlf]",
-	"@split-connect": "CONNECT [host_port] [protocol][crlf][split]Host: [host][crlf][split]Proxy-Connection: Keep-Alive[crlf][crlf]",
-	"@get":           "GET / [protocol][crlf]Host: [host][crlf]User-Agent: [ua][crlf]Connection: Keep-Alive[crlf][crlf]",
-	"@head":          "HEAD / [protocol][crlf]Host: [host][crlf]User-Agent: [ua][crlf]Connection: Keep-Alive[crlf][crlf]",
-	"@post":          "POST / [protocol][crlf]Host: [host][crlf]User-Agent: [ua][crlf]Content-Length: 0[crlf]Connection: Keep-Alive[crlf][crlf]",
-	"@websocket":     "GET / [protocol][crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf]Sec-WebSocket-Key: [ws_key][crlf]Sec-WebSocket-Version: 13[crlf][crlf]",
-}
-
-// PresetNames lists the built-in presets ("@connect", ...), sorted.
-func PresetNames() []string {
-	out := make([]string, 0, len(presets))
-	for k := range presets {
-		out = append(out, k)
-	}
-	sort.Strings(out)
-	return out
-}
-
 // Context holds per-connection values for tag substitution.
 type Context struct {
-	Host      string
-	Port      int
-	IP        string // resolved server address; falls back to Host
-	SNI       string // falls back to Host
-	Method    string
-	Protocol  string
-	UserAgent string
-	Vars      map[string]string
+	Host       string // [host]: the payload host (bug host) if set, else the server host
+	Port       int
+	Server     string // [server]: the real server host; falls back to Host
+	ServerPort int    // [server_port]; falls back to Port
+	IP         string // resolved address of the real server; falls back to Server
+	SNI        string // falls back to Host
+	Method     string
+	Protocol   string
+	UserAgent  string
+	Vars       map[string]string
 }
 
 // Segment is one write to the wire followed by an optional pause.
@@ -146,6 +135,7 @@ type Template struct {
 var simpleTags = map[string]bool{
 	"crlf": true, "cr": true, "lf": true, "lfcr": true, "tab": true, "space": true,
 	"host": true, "port": true, "host_port": true, "ip": true, "ip_port": true, "sni": true,
+	"server": true, "server_port": true, "server_host_port": true,
 	"method": true, "protocol": true, "ua": true, "rand_ua": true, "random_ua": true,
 	"netdata": true, "raw": true, "realdata": true,
 	"get": true, "post": true, "put": true, "head": true, "options": true,
@@ -156,8 +146,10 @@ var simpleTags = map[string]bool{
 
 // Compile parses a payload template.
 func Compile(tpl string) (*Template, error) {
-	if p, ok := presets[asciiLower(strings.TrimSpace(tpl))]; ok {
-		tpl = p
+	// Presets were removed. A bare "@name" would otherwise be sent to the
+	// server as literal text, so refuse it with a clear reason.
+	if t := strings.TrimSpace(tpl); strings.HasPrefix(t, "@") && !strings.ContainsAny(t, "[] \t\r\n\\") {
+		return nil, fmt.Errorf("payload: presets (%s) are not supported; write the payload yourself", t)
 	}
 	return compile(tpl, 0)
 }
@@ -368,10 +360,16 @@ func (r *renderer) tag(p *part) {
 		r.w(strconv.Itoa(c.Port))
 	case "host_port":
 		r.w(hostPort(c.Host, c.Port))
+	case "server":
+		r.w(c.Server)
+	case "server_port":
+		r.w(strconv.Itoa(c.ServerPort))
+	case "server_host_port":
+		r.w(hostPort(c.Server, c.ServerPort))
 	case "ip":
-		r.w(orStr(c.IP, c.Host))
+		r.w(orStr(c.IP, c.Server))
 	case "ip_port":
-		r.w(hostPort(orStr(c.IP, c.Host), c.Port))
+		r.w(hostPort(orStr(c.IP, c.Server), c.ServerPort))
 	case "sni":
 		r.w(orStr(c.SNI, c.Host))
 	case "method":
@@ -471,6 +469,12 @@ func (t *Template) Render(c Context) []Segment {
 	}
 	if c.Method == "" {
 		c.Method = "GET"
+	}
+	if c.Server == "" {
+		c.Server = c.Host
+	}
+	if c.ServerPort == 0 {
+		c.ServerPort = c.Port
 	}
 	if c.Protocol == "" {
 		c.Protocol = "HTTP/1.1"

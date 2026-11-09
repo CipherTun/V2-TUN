@@ -128,12 +128,12 @@ func TestScanRejectsUnknownField(t *testing.T) {
 
 func TestPreviewPayload(t *testing.T) {
 	out, err := PreviewPayload(&Config{Protocol: "ssh", Server: "origin.example", Port: 80,
-		Payload: &PayloadConfig{Template: "@ssh-ws", Host: "bug.example.com", ResponseMap: map[string]int{"301": 200}}})
+		Payload: &PayloadConfig{Template: sshWSPayload, Host: "bug.example.com"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, want := range []string{"origin.example:80", "GET / HTTP/1.1", "Host: bug.example.com", "Upgrade: websocket",
-		"expects 1 HTTP reply", "301 counts as 200"} {
+		"expects 1 HTTP reply", "every status below 400 is accepted"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("preview lacks %q:\n%s", want, out)
 		}

@@ -21,7 +21,7 @@ func TestVisionFlowOnlyForVLESS(t *testing.T) {
 func TestVisionWithPayloadAndFragment(t *testing.T) {
 	cfg := &Config{Protocol: "vless", Server: "example.com", Port: 443, UUID: visionTestUUID,
 		Flow: "xtls-rprx-vision", TLS: TLSConfig{Enabled: true, SNI: "example.com"},
-		Payload:  &PayloadConfig{Template: "@connect", Host: "bug.example.com"},
+		Payload:  &PayloadConfig{Template: connectPayload, Host: "bug.example.com"},
 		Fragment: &FragmentConfig{Length: [2]int{10, 40}, Interval: [2]int{5, 20}}}
 	if _, err := New(cfg); err != nil {
 		t.Fatalf("Vision with a payload and fragment: %v", err)

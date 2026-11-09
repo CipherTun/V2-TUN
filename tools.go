@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 	"regexp"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -122,26 +121,6 @@ func Scan(ctx context.Context, cfg *Config, field string, values []string, targe
 
 var previewRequestLine = regexp.MustCompile(`(?m)^[A-Za-z]+ \S+ HTTP/1\.[01]\r?$`)
 
-func acceptedText(codes []int, rm map[string]int) string {
-	s := "101 and 2xx"
-	if len(codes) > 0 {
-		parts := make([]string, len(codes))
-		for i, c := range codes {
-			parts[i] = strconv.Itoa(c)
-		}
-		s = strings.Join(parts, ", ")
-	}
-	if len(rm) > 0 {
-		var ch []string
-		for k, v := range rm {
-			ch = append(ch, k+" counts as "+strconv.Itoa(v))
-		}
-		sort.Strings(ch)
-		s += " (" + strings.Join(ch, ", ") + ")"
-	}
-	return s
-}
-
 // PreviewPayload shows what the payload of cfg would send, segment by segment
 // (with the pause after each one), where it would go, and whether and how its
 // HTTP replies are checked. Nothing is sent.
@@ -154,10 +133,6 @@ func PreviewPayload(cfg *Config) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	rm, err := normalizeResponseMap(p.ResponseMap)
-	if err != nil {
-		return "", err
-	}
 	sni := cfg.TLS.SNI
 	if cfg.Reality != nil && cfg.Reality.ServerName != "" {
 		sni = cfg.Reality.ServerName
@@ -166,8 +141,8 @@ func PreviewPayload(cfg *Config) (string, error) {
 	if p.Host != "" {
 		host = p.Host
 	}
-	segs := tpl.Render(payload.Context{Host: host, Port: cfg.Port, IP: cfg.Server, SNI: sni,
-		Method: p.Method, UserAgent: p.UserAgent, Vars: p.Vars})
+	segs := tpl.Render(payload.Context{Host: host, Port: cfg.Port, Server: cfg.Server, ServerPort: cfg.Port,
+		IP: cfg.Server, SNI: sni, Method: p.Method, UserAgent: p.UserAgent, Vars: p.Vars})
 
 	var b strings.Builder
 	dest := net.JoinHostPort(cfg.Server, strconv.Itoa(cfg.Port))
@@ -200,7 +175,7 @@ func PreviewPayload(cfg *Config) (string, error) {
 				n = 4
 			}
 		}
-		fmt.Fprintf(&b, "expects %d HTTP reply(ies); accepted: %s\n", n, acceptedText(p.ExpectCodes, rm))
+		fmt.Fprintf(&b, "expects %d HTTP reply(ies); every status below 400 is accepted\n", n)
 	} else {
 		b.WriteString("expects no HTTP reply\n")
 	}

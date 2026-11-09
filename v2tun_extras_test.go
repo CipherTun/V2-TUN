@@ -53,7 +53,7 @@ func TestProbeAddr(t *testing.T) {
 	if got := probeAddr(c); got != "a.example:22" {
 		t.Errorf("server: %q", got)
 	}
-	c.Payload = &PayloadConfig{Template: "@connect", Proxy: "10.0.0.1:8080"}
+	c.Payload = &PayloadConfig{Template: connectPayload, Proxy: "10.0.0.1:8080"}
 	if got := probeAddr(c); got != "10.0.0.1:8080" {
 		t.Errorf("payload proxy: %q", got)
 	}

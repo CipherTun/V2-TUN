@@ -116,26 +116,27 @@ func ExplainRoute(network, addr, protocol string) (string, error) {
 
 // ValidatePayload reports whether a payload template compiles. It accepts the
 // same HTTP Injector spellings as the tunnel itself ([ssh], [real_raw],
-// [b64=random16], @ssh-ws).
+// [b64=random16]). Presets are gone, so a bare "@name" is reported as invalid.
 func ValidatePayload(template string) error {
 	_, err := payload.CompileCompat(template)
 	return err
 }
 
-// PreviewPayload renders a template with the given server host and port and
-// returns it with visible \r\n and markers where it is split or paused. The
-// template is compiled the way the tunnel compiles it, so aliases such as
-// [ssh] preview as they will be sent.
-func PreviewPayload(template, host string, port int) (string, error) {
+// PreviewPayload renders a template and returns it with visible \r\n and
+// markers where it is split or paused. host is the payload host ([host], the
+// bug host), server the real server ([server], [server_host_port]); an empty
+// server means the same as host. The template is compiled the way the tunnel
+// compiles it, so aliases such as [ssh] preview as they will be sent.
+func PreviewPayload(template, host, server string, port int) (string, error) {
 	t, err := payload.CompileCompat(template)
 	if err != nil {
 		return "", err
 	}
-	return t.Preview(payload.Context{Host: host, Port: port}), nil
+	if server == "" {
+		server = host
+	}
+	return t.Preview(payload.Context{Host: host, Port: port, Server: server, ServerPort: port, IP: server}), nil
 }
-
-// PayloadPresets lists the built-in payload presets, one per line.
-func PayloadPresets() string { return strings.Join(payload.PresetNames(), "\n") }
 
 // StartTun routes the TUN fd through the tunnel with default options.
 func StartTun(configJSON string, fd int, mtu int, dns string) error {

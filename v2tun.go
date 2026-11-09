@@ -62,13 +62,20 @@ type HysteriaConfig struct {
 
 // PayloadConfig is the HTTP-Injector style payload sent right after the TCP
 // connect (or after TLS with Stage "post-tls"). See package payload for tags.
+// There are no presets: the template is exactly what you write.
 //
-// "SSH over WebSocket" needs no TLS: protocol ssh, a payload such as
-// "@ssh-ws" (or your own GET ... Upgrade: websocket request) and, if you use
-// one, an HTTP proxy in Proxy. Whether TLS is used is up to the config.
+// "SSH over WebSocket" needs no TLS: protocol ssh, a payload that you write
+// (for example "GET / HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf][crlf]",
+// or, through a remote proxy, "CONNECT [server_host_port] HTTP/1.1[crlf]Host: [host][crlf][crlf]")
+// and, if you use one, an HTTP proxy in Proxy. With network "ws" the order is
+// proxy, payload, WebSocket, SSH. Whether TLS is used is up to the config.
+//
+// The server's HTTP reply to the payload is handled automatically and has no
+// settings: every status below 400 (101, 2xx, 3xx) lets the tunnel start, a
+// 4xx or 5xx reply fails it.
 type PayloadConfig struct {
-	Template  string `json:"template"` // a template or a preset such as "@connect" or "@ssh-ws"
-	Host      string `json:"host"`     // value for [host] (and [host_port]); empty => server host
+	Template  string `json:"template"` // the payload, with tags such as [host], [crlf], [server_host_port]
+	Host      string `json:"host"`     // value for [host] and [host_port] (the bug host); empty => server host. [server], [server_port] and [server_host_port] always name the real server
 	Method    string `json:"method"`
 	UserAgent string `json:"userAgent"`
 	Stage     string `json:"stage"` // "pre-tls" (default) or "post-tls"
@@ -79,16 +86,12 @@ type PayloadConfig struct {
 	ExpectResponse *bool `json:"expectResponse,omitempty"`
 	// ExpectResponses is how many replies to read; 0 means one per HTTP request
 	// line in the payload (a CONNECT followed by an Upgrade request gives two).
-	ExpectResponses int   `json:"expectResponses,omitempty"`
-	ExpectCodes     []int `json:"expectCodes,omitempty"` // accepted status codes; empty => 101 and any 2xx; 0 accepts any
-	// ResponseMap is the response changer: a status code the server sent ("301",
-	// or a class such as "3xx") counts as the code it maps to, so
-	// {"301": 200} makes "301 Moved Permanently" work like "200 OK".
-	ResponseMap map[string]int    `json:"responseMap,omitempty"`
-	Vars        map[string]string `json:"vars,omitempty"` // values for [var=name]
+	ExpectResponses int               `json:"expectResponses,omitempty"`
+	Vars            map[string]string `json:"vars,omitempty"` // values for [var=name]
 	// Proxy ("host:port") is HTTP-Injector's remote proxy mode: the TCP
-	// connection goes to this proxy, the payload names the real server in
-	// [host_port]. It needs the pre-tls stage.
+	// connection goes to this proxy, the payload names the real server with
+	// [server_host_port] (or [server] and [server_port]). It needs the pre-tls
+	// stage.
 	Proxy string `json:"proxy,omitempty"`
 }
 
@@ -791,7 +794,7 @@ func realityDialer(cfg *Config, inner transport.Dialer, alpn []string) (transpor
 // payloadExpectsReply decides whether the HTTP reply to the payload is read
 // and dropped before the protocol starts. An explicit expectResponse wins.
 // Otherwise: always with a remote proxy, and on a plain tcp stream whenever the
-// payload looks like an HTTP request (a preset, or a request line), because
+// payload looks like an HTTP request (a request line), because
 // the server then answers with a status line before the protocol begins, as
 // an SSH-WS server does with "101 Switching Protocols". With another transport
 // (ws, h2, ...) the payload is front traffic and gets no automatic reply.
@@ -806,31 +809,8 @@ func payloadExpectsReply(net_ string, p *PayloadConfig) bool {
 		return false
 	}
 	t := strings.ToLower(p.Template)
-	return strings.HasPrefix(strings.TrimSpace(t), "@") || strings.Contains(t, "http/1.") ||
-		strings.Contains(t, "[protocol]") || strings.Contains(t, "[netdata]") ||
-		strings.Contains(t, "[raw]") || strings.Contains(t, "[real_raw]")
-}
-
-// normalizeResponseMap checks a response changer map and lower-cases its keys.
-// A key is a status code ("301") or a class ("3xx"); a value is a status code.
-func normalizeResponseMap(m map[string]int) (map[string]int, error) {
-	if len(m) == 0 {
-		return nil, nil
-	}
-	out := make(map[string]int, len(m))
-	for k, v := range m {
-		k = strings.ToLower(strings.TrimSpace(k))
-		isCode := len(k) == 3 && strings.Trim(k, "0123456789") == ""
-		isClass := len(k) == 3 && k[1:] == "xx" && k[0] >= '1' && k[0] <= '5'
-		if !isCode && !isClass {
-			return nil, fmt.Errorf("v2tun: responseMap key %q must be a status code like 301 or a class like 3xx", k)
-		}
-		if v < 100 || v > 599 {
-			return nil, fmt.Errorf("v2tun: responseMap value %d for %q is not a status code", v, k)
-		}
-		out[k] = v
-	}
-	return out, nil
+	return strings.Contains(t, "http/1.") || strings.Contains(t, "[protocol]") ||
+		strings.Contains(t, "[netdata]") || strings.Contains(t, "[raw]") || strings.Contains(t, "[real_raw]")
 }
 
 // baseChain builds tcp -> [payload pre] -> [record layer, Vision only] -> tls|reality -> [payload post] (or QUIC / mKCP alone).
@@ -869,14 +849,10 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 		if err != nil {
 			return nil, err
 		}
-		rm, err := normalizeResponseMap(p.ResponseMap)
-		if err != nil {
-			return nil, err
-		}
 		pd = &transport.Payload{Template: tpl, Host: p.Host, Method: p.Method,
 			UserAgent: p.UserAgent, SNI: psni, Vars: p.Vars,
-			ExpectResponse: payloadExpectsReply(net_, p), ExpectCodes: p.ExpectCodes,
-			Responses: p.ExpectResponses, ResponseMap: rm}
+			ExpectResponse: payloadExpectsReply(net_, p),
+			Responses:      p.ExpectResponses, ViaProxy: p.Proxy != "", Resolver: res}
 	}
 	post := pd != nil && cfg.Payload.Stage == "post-tls"
 	if pd != nil && cfg.Payload.Proxy != "" {

@@ -18,22 +18,18 @@ func renderCompat(t *testing.T, tpl string, c Context) string {
 	return b.String()
 }
 
-// @ssh-ws and @ssh-ws/tcp work with plain Compile and CompileCompat alike,
-// and stay two different payloads (GET upgrade vs CONNECT upgrade).
-func TestSSHWSPresetsDirect(t *testing.T) {
+func TestCompatAliases(t *testing.T) {
 	c := Context{Host: "h.example", Port: 22}
-	ws := render(t, "@ssh-ws", c)
-	if !strings.HasPrefix(ws, "GET / HTTP/1.1\r\n") || !strings.Contains(ws, "Upgrade: websocket\r\n") {
-		t.Fatalf("@ssh-ws: %q", ws)
+	if got := renderCompat(t, "CONNECT [ssh] HTTP/1.1", c); got != "CONNECT h.example:22 HTTP/1.1" {
+		t.Errorf("[ssh]: %q", got)
 	}
-	tcp := render(t, "@ssh-ws/tcp", c)
-	if !strings.HasPrefix(tcp, "CONNECT h.example:22 HTTP/1.1\r\n") {
-		t.Fatalf("@ssh-ws/tcp: %q", tcp)
+	if got := renderCompat(t, "[real_raw]", c); got != "CONNECT h.example:22 HTTP/1.1" {
+		t.Errorf("[real_raw]: %q", got)
 	}
-	if got := renderCompat(t, "@ssh-ws", c); got != ws {
-		t.Errorf("CompileCompat(@ssh-ws) = %q, want %q", got, ws)
+	if got := renderCompat(t, "Sec-WebSocket-Key: [b64=random16]", c); len(got) != len("Sec-WebSocket-Key: ")+24 {
+		t.Errorf("[b64=random16]: %q", got)
 	}
-	if got := renderCompat(t, " @SSH-WS/TCP ", c); got != tcp {
-		t.Errorf("CompileCompat(@ssh-ws/tcp) = %q, want %q", got, tcp)
+	if _, err := CompileCompat("@ssh-ws"); err == nil {
+		t.Error("CompileCompat must reject a preset name too")
 	}
 }

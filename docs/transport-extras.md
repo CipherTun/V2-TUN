@@ -16,7 +16,7 @@ inside the jump session; traffic exits there.
   "protocol": "ssh",
   "server": "jump.example.com", "port": 443,
   "username": "u1", "password": "p1",
-  "payload": {"template": "@ssh-ws/tcp", "host": "bug.host.example"},
+  "payload": {"template": "CONNECT [host_port] HTTP/1.1[crlf]Host: [host][crlf]Upgrade: websocket[crlf]Connection: Upgrade[crlf][crlf]", "host": "bug.host.example"},
   "advanced": {
     "sshHostKey": "SHA256:...",
     "sshNext": {
@@ -53,14 +53,8 @@ fastest is tried first and servers that did not answer go last. Hysteria and
 QUIC outbounds cannot be probed with TCP and rank between the two groups.
 `activeOutbound` still reports the index in the config list.
 
-## Extra payload presets
+## Payload aliases
 
-| Preset | Payload |
-| --- | --- |
-| `@ssh-ws/tcp`, `@ssh-ws/udp` | `CONNECT [host_port]` with `Upgrade: websocket` headers |
-| `@get-proxy` | `GET http://[host]/` (absolute URI) |
-| `@head-proxy` | `HEAD http://[host]/` |
-| `@post-proxy` | `POST http://[host]/`, empty body |
-
-`@ssh-ws`, `@get`, `@head` and `@post` are unchanged. `[b64=random16]` is
-accepted as a spelling of `[ws_key]`.
+There are no payload presets; write the payload yourself. `[b64=random16]` is
+accepted as a spelling of `[ws_key]`, `[ssh]` as `[host_port]` and `[real_raw]`
+as `[raw]`.

@@ -161,16 +161,32 @@ func TestBytesAndVars(t *testing.T) {
 	}
 }
 
-func TestPresets(t *testing.T) {
-	got := render(t, "@websocket", Context{Host: "h.example", Port: 80})
-	if !strings.Contains(got, "Upgrade: websocket\r\n") || !strings.Contains(got, "Host: h.example\r\n") ||
-		!strings.HasSuffix(got, "\r\n\r\n") {
-		t.Fatalf("got %q", got)
-	}
-	for _, name := range PresetNames() {
-		if _, err := Compile(name); err != nil {
-			t.Errorf("preset %s: %v", name, err)
+func TestPresetsRemoved(t *testing.T) {
+	for _, name := range []string{"@connect", "@ssh-ws", " @websocket "} {
+		if _, err := Compile(name); err == nil {
+			t.Errorf("%q: presets are gone, a bare @name must be rejected", name)
 		}
+	}
+	// text that merely starts with @ but is a real payload still compiles
+	if _, err := Compile("@[host]"); err != nil {
+		t.Errorf("a payload with tags must compile: %v", err)
+	}
+}
+
+// [host] is the bug host; [server*] and [ip*] always name the real target.
+func TestServerTags(t *testing.T) {
+	c := Context{Host: "bug.example", Port: 8080, Server: "ssh.example", ServerPort: 22, IP: "203.0.113.7"}
+	got := render(t, "CONNECT [server_host_port] [protocol][crlf]Host: [host][crlf]X: [server]|[server_port]|[ip]|[ip_port]|[host_port]|[netData]", c)
+	want := "CONNECT ssh.example:22 HTTP/1.1\r\nHost: bug.example\r\nX: ssh.example|22|203.0.113.7|203.0.113.7:22|bug.example:8080|CONNECT bug.example:8080 HTTP/1.1"
+	if got != want {
+		t.Fatalf("got  %q\nwant %q", got, want)
+	}
+	// without Server the tags fall back to the host, so old callers keep working
+	if got := render(t, "[server]:[server_port]", Context{Host: "h", Port: 80}); got != "h:80" {
+		t.Fatalf("fallback: %q", got)
+	}
+	if got := render(t, "[server_host_port]", Context{Server: "::1", ServerPort: 22}); got != "[::1]:22" {
+		t.Fatalf("ipv6: %q", got)
 	}
 }
 

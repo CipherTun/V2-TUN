@@ -51,9 +51,8 @@ the tunnel's own sockets are already exempt through `SetProtector`.
 ## Payload helpers
 
 - `mobile.ValidatePayload(template)` returns an error for a template that does not compile.
-- `mobile.PreviewPayload(template, host, port)` renders it with visible `\r\n` and `--- split ---` / `--- wait Nms ---`
+- `mobile.PreviewPayload(template, host, server, port)` renders it with visible `\r\n` and `--- split ---` / `--- wait Nms ---`
   markers, so users can check a payload before connecting.
-- `mobile.PayloadPresets()` lists the built-in presets (`@connect`, `@get`, `@websocket`, ...), one per line.
 
 The tag list is at the top of `payload/payload.go`. Notes on the less obvious ones: `[netData]`, `[raw]` and `[realData]`
 all render the request line `<method|CONNECT> host:port HTTP/1.1`; `[crlf*2]` repeats; tags nest (`[b64=[host]:[port]]`);

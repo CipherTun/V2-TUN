@@ -12,7 +12,7 @@ func FuzzCompile(f *testing.F) {
 		"[random=a|b|c]",
 		"[rotate=a|b]",
 		"@connect",
-		"@ssh-ws",
+		"CONNECT [server_host_port] [protocol][crlf]Host: [host][crlf][crlf]",
 		"[var=token]",
 		"[ssh][real_raw]",
 		"[unclosed",

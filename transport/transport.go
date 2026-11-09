@@ -212,6 +212,11 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 // then speaks raw SSH (no WebSocket framing), so the reply must not reach the
 // SSH client. Only the status line and headers are read; a body, if a server
 // sends one, is not skipped.
+//
+// Every reply is accepted unless its status is 400 or higher; there is nothing
+// to configure, which is how HTTP Custom, HTTP Injector and NetMod behave (a
+// 200, a 301 or a made-up "HTTP/1.1 3xx" from a front all let the tunnel
+// start, a 4xx or 5xx does not).
 type Payload struct {
 	Inner          Dialer
 	Template       *payload.Template
@@ -221,42 +226,18 @@ type Payload struct {
 	SNI            string            // value for [sni]
 	Vars           map[string]string // values for [var=name]
 	ExpectResponse bool              // read and validate the HTTP replies before continuing
-	ExpectCodes    []int             // accepted status codes; empty => 101 and any 2xx; 0 accepts any
 	Responses      int               // replies to read; 0 => one per HTTP request line in the payload (1 to 4)
 
-	// ResponseMap is the "response changer": a status code the server sent
-	// ("301", or a whole class such as "3xx") is treated as the code it maps
-	// to before the accept check, so {"301": 200} makes a "301 Moved
-	// Permanently" count as "200 OK". Exact codes win over classes. Keys must
-	// be lower case.
-	ResponseMap map[string]int
+	// ViaProxy says the connection below goes to a remote proxy, not to addr.
+	// [ip] and [ip_port] then name the real server (resolved with Resolver)
+	// instead of the proxy.
+	ViaProxy bool
+	Resolver *net.Resolver // nil => system resolver
 }
 
-func codeOK(code int, allowed []int) bool {
-	if len(allowed) == 0 {
-		return code == 101 || (code >= 200 && code < 300)
-	}
-	for _, a := range allowed {
-		if a == code || a == 0 {
-			return true
-		}
-	}
-	return false
-}
-
-// mapCode applies ResponseMap to a status code sent by the server.
-func (d *Payload) mapCode(code int) int {
-	if len(d.ResponseMap) == 0 {
-		return code
-	}
-	if to, ok := d.ResponseMap[strconv.Itoa(code)]; ok {
-		return to
-	}
-	if to, ok := d.ResponseMap[strconv.Itoa(code/100)+"xx"]; ok {
-		return to
-	}
-	return code
-}
+// codeOK accepts every reply below 400: 1xx (101 Switching Protocols), 2xx
+// and 3xx. A 4xx or 5xx reply, or a status that is not a status, is refused.
+func codeOK(code int) bool { return code >= 100 && code < 400 }
 
 var requestLine = regexp.MustCompile(`(?m)^[A-Za-z]+ \S+ HTTP/1\.[01]\r?$`)
 
@@ -288,11 +269,43 @@ func (d *Payload) readReplies(c net.Conn, segs []payload.Segment) error {
 		if err != nil {
 			return fmt.Errorf("payload: waiting for reply %d of %d: %w", i+1, n, err)
 		}
-		if !codeOK(d.mapCode(raw), d.ExpectCodes) {
+		if !codeOK(raw) {
 			return fmt.Errorf("payload: reply %d of %d has status %d", i+1, n, raw)
 		}
 	}
 	return nil
+}
+
+// serverIP is the address [ip] stands for: the peer of the connection, or,
+// behind a remote proxy (where the peer is the proxy), the real server.
+func (d *Payload) serverIP(ctx context.Context, c net.Conn, host string) string {
+	if !d.ViaProxy {
+		if ra, ok := c.RemoteAddr().(*net.TCPAddr); ok && ra.IP != nil {
+			return ra.IP.String() // the address we actually connected to
+		}
+		return host
+	}
+	if net.ParseIP(host) != nil {
+		return host
+	}
+	rs := d.Resolver
+	if rs == nil {
+		rs = net.DefaultResolver
+	}
+	cx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	ips, err := rs.LookupIPAddr(cx, host)
+	if err != nil || len(ips) == 0 {
+		return host
+	}
+	pick := ips[0].IP
+	for _, a := range ips {
+		if a.IP.To4() != nil {
+			pick = a.IP
+			break
+		}
+	}
+	return pick.String()
 }
 
 func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -302,15 +315,13 @@ func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Co
 	}
 	h, p, _ := net.SplitHostPort(addr)
 	port, _ := strconv.Atoi(p)
-	ip := h
-	if ra, ok := c.RemoteAddr().(*net.TCPAddr); ok && ra.IP != nil {
-		ip = ra.IP.String() // [ip] / [ip_port]: the address we actually connected to
-	}
+	server := h // the real target: [host] may be replaced by the bug host below
+	ip := d.serverIP(ctx, c, server)
 	if d.Host != "" {
 		h = d.Host
 	}
-	segs := d.Template.Render(payload.Context{Host: h, Port: port, IP: ip, SNI: d.SNI, Method: d.Method,
-		UserAgent: d.UserAgent, Vars: d.Vars})
+	segs := d.Template.Render(payload.Context{Host: h, Port: port, Server: server, ServerPort: port, IP: ip,
+		SNI: d.SNI, Method: d.Method, UserAgent: d.UserAgent, Vars: d.Vars})
 	if err := payload.SendContext(ctx, c, segs); err != nil {
 		c.Close()
 		return nil, err

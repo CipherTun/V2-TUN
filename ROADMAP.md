@@ -17,7 +17,7 @@ Everything under **Shipped** is described in the [README](README.md) and works a
 - **XTLS Vision** for vless (record layer, `checkFlow` validation); still untested against a live server, see below
 - **Transports**: tcp, ws, httpupgrade, h2, grpc, quic, **xhttp** (auto, packet-up, stream-up, stream-one), REALITY, TLS fragmenting
 - **TLS checks**: certificate pinning (`tls.pinSha256`) and a verify name (`tls.verifyName`); both are rejected where they would be ignored
-- **Payload engine**: HTTP Injector style tags and presets, `@ssh-ws`, `@ssh-ws/tcp`, response changer, remote proxy mode
+- **Payload engine**: HTTP Injector style tags (no presets), automatic reply check (below 400 passes), remote proxy mode, `[server]` tags
 - **SSH extras**: double hop (`sshNext`), host key pinning, encrypted private keys (`passphrase`)
 - **Reliability**: failover with `backups`, latency sort, WebSocket ping, HTTP/2 PING keepalive, idle timeout
 - **Routing**: rules, split tunneling, geoip/geosite lists, live `UpdateRouting`, `ExplainRoute`
