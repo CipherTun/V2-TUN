@@ -174,6 +174,18 @@ func resolveDst(dst string, o Options) string {
 	return dst
 }
 
+// closeWriter is a connection that can close just its sending side.
+type closeWriter interface{ CloseWrite() error }
+
+const (
+	// halfCloseWait is how long a connection stays open for the reply after the
+	// client stopped sending, when the far side was told about it (CloseWrite).
+	halfCloseWait = 15 * time.Second
+	// flushWait is the same when the far side cannot be told: just long enough
+	// for a reply that is already on its way to reach the client.
+	flushWait = 2 * time.Second
+)
+
 func relay(ctx context.Context, local net.Conn, dst string, o Options) {
 	defer local.Close()
 	dst = resolveDst(dst, o)
@@ -214,11 +226,27 @@ func relay(ctx context.Context, local net.Conn, dst string, o Options) {
 			return
 		}
 	}
-	done := make(chan struct{}, 2)
-	go func() { io.Copy(up, local); done <- struct{}{} }()
-	go func() { io.Copy(local, up); done <- struct{}{} }()
+	done := make(chan int, 2)
+	go func() { io.Copy(up, local); done <- 0 }() // client to server
+	go func() { io.Copy(local, up); done <- 1 }() // server to client
 	select {
-	case <-done:
+	case which := <-done:
+		if which == 0 {
+			// The client stopped sending. That is how a client half-closes after its
+			// request, and the reply may still be on its way: tear down at once and
+			// the end of it would be cut off. Tell the server when that is possible.
+			wait := flushWait
+			if cw, ok := up.(closeWriter); ok && cw.CloseWrite() == nil {
+				wait = halfCloseWait
+			}
+			t := time.NewTimer(wait)
+			defer t.Stop()
+			select {
+			case <-done:
+			case <-t.C:
+			case <-ctx.Done():
+			}
+		}
 	case <-ctx.Done():
 	}
 }
