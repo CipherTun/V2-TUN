@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"regexp"
 	"strconv"
@@ -212,13 +213,13 @@ func (d *TLS) DialContext(ctx context.Context, network, addr string) (net.Conn, 
 // then carries the SSH stream, so the reply must not reach the SSH client.
 // A 101 ends HTTP on the connection, so reading stops there even when the
 // payload held more request lines (a decoy line the server never answers must
-// not stall the dial). Only the status line and headers are read; a body, if a
-// server sends one, is not skipped.
+// not stall the dial). Only the status line and headers are read, plus, with
+// SkipBody, a short body announced by Content-Length.
 //
-// Every reply is accepted unless its status is 400 or higher; there is nothing
-// to configure, which is how HTTP Custom, HTTP Injector and NetMod behave (a
-// 200, a 301 or a made-up "HTTP/1.1 3xx" from a front all let the tunnel
-// start, a 4xx or 5xx does not).
+// Every reply is accepted unless its status is 400 or higher, or the status is
+// listed in AcceptStatus; this is how HTTP Custom, HTTP Injector and NetMod
+// behave (a 200, a 301 or a made-up "HTTP/1.1 3xx" from a front all let the
+// tunnel start, a 4xx or 5xx does not).
 type Payload struct {
 	Inner          Dialer
 	Template       *payload.Template
@@ -229,6 +230,15 @@ type Payload struct {
 	Vars           map[string]string // values for [var=name]
 	ExpectResponse bool              // read and validate the HTTP replies before continuing
 	Responses      int               // replies to read; 0 => one per HTTP request line in the payload (1 to 4)
+
+	// AcceptStatus lists statuses of 400 and above that are accepted anyway,
+	// for a server that answers with an error status and then tunnels.
+	AcceptStatus []int
+	// SkipBody reads and drops a reply body announced by Content-Length (up to
+	// maxSkippedBody bytes) before the protocol starts. It does not apply to
+	// 101 replies, to 1xx, 204 and 304 replies, or to replies to a CONNECT
+	// request, where the tunnel data follows the headers directly.
+	SkipBody bool
 
 	// AutoWS (ssh over a plain tcp stream) detects, after the server accepted
 	// a payload that asks for "Upgrade: websocket", whether the stream is
@@ -242,11 +252,64 @@ type Payload struct {
 	Resolver *net.Resolver // nil => system resolver
 }
 
+// maxSkippedBody is the longest reply body SkipBody drops. A larger
+// Content-Length is more likely a made-up value in front of a tunnel than a
+// real page, so it is left alone.
+const maxSkippedBody = 64 << 10
+
 // codeOK accepts every reply below 400: 1xx (101 Switching Protocols), 2xx
 // and 3xx. A 4xx or 5xx reply, or a status that is not a status, is refused.
 func codeOK(code int) bool { return code >= 100 && code < 400 }
 
+// accepts reports whether a reply with this status lets the tunnel start:
+// every status below 400, plus the ones listed in AcceptStatus.
+func (d *Payload) accepts(code int) bool {
+	if codeOK(code) {
+		return true
+	}
+	for _, c := range d.AcceptStatus {
+		if c == code {
+			return true
+		}
+	}
+	return false
+}
+
 var requestLine = regexp.MustCompile(`(?m)^[A-Za-z]+ \S+ HTTP/1\.[01]\r?$`)
+
+// requestMethodLine is requestLine with the method captured.
+var requestMethodLine = regexp.MustCompile(`(?m)^([A-Za-z]+) \S+ HTTP/1\.[01]\r?$`)
+
+// requestMethods lists the method of every HTTP request line in the rendered
+// payload, in order, upper-cased.
+func requestMethods(segs []payload.Segment) []string {
+	var all []byte
+	for _, s := range segs {
+		all = append(all, s.Data...)
+	}
+	var out []string
+	for _, m := range requestMethodLine.FindAllSubmatch(all, -1) {
+		out = append(out, strings.ToUpper(string(m[1])))
+	}
+	return out
+}
+
+// contentLength returns the Content-Length of a reply's header block, or 0
+// when there is none or it is not a number.
+func contentLength(head string) int64 {
+	for _, line := range strings.Split(head, "\n") {
+		k, v, ok := strings.Cut(line, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(k), "content-length") {
+			continue
+		}
+		n, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+		if err != nil || n < 0 {
+			return 0
+		}
+		return n
+	}
+	return 0
+}
 
 // countRequests counts the HTTP request lines in the rendered payload, so a
 // payload that holds two requests (CONNECT to a proxy, then an Upgrade
@@ -274,16 +337,25 @@ func (d *Payload) readReplies(c net.Conn, segs []payload.Segment) (accepted bool
 	if n <= 0 {
 		n = countRequests(segs)
 	}
+	methods := requestMethods(segs)
 	for i := 0; i < n; i++ {
 		code, head, err := payload.ReadHTTPReply(c)
 		if err != nil {
 			return false, fmt.Errorf("payload: waiting for reply %d of %d: %w", i+1, n, err)
 		}
-		if !codeOK(code) {
+		if !d.accepts(code) {
 			return false, fmt.Errorf("payload: reply %d of %d has status %d", i+1, n, code)
 		}
 		if code == 101 {
 			return strings.Contains(strings.ToLower(head), "\nsec-websocket-accept:"), nil
+		}
+		isConnect := i < len(methods) && methods[i] == "CONNECT"
+		if d.SkipBody && !isConnect && code >= 200 && code != 204 && code != 304 {
+			if cl := contentLength(head); cl > 0 && cl <= maxSkippedBody {
+				if _, err := io.CopyN(io.Discard, c, cl); err != nil {
+					return false, fmt.Errorf("payload: reading the body of reply %d of %d: %w", i+1, n, err)
+				}
+			}
 		}
 	}
 	return false, nil
