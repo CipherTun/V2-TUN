@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mrand "math/rand"
 	"net"
 	"sync"
 	"time"
@@ -13,12 +14,21 @@ import (
 // Failover tries several outbounds in order (a second server, another bug
 // host or payload, another protocol) and remembers the one that worked last,
 // so the next connection starts there. Each attempt is limited to PerTry.
+//
+// With Balance set, the outbounds share the load instead: every new connection
+// starts at the next outbound ("roundrobin") or at a random one ("random"), and
+// an outbound that fails still hands the connection on to the next.
 type Failover struct {
 	Outs   []Outbound
 	PerTry time.Duration // limit for each outbound's attempt (default 12s)
+	// Balance spreads connections over the outbounds: "" keeps the plain
+	// failover order, "roundrobin" or "random" share the load. It replaces the
+	// "worked last first" order and the latency ranking.
+	Balance string
 
 	mu    sync.Mutex
 	cur   int
+	rr    uint               // round-robin counter (Balance "roundrobin")
 	rank  []int              // latency ranking (indexes into Outs) set by StartLatencyEngine; nil => list order
 	alive []bool             // reachability seen by the last latency probe; nil before the first one
 	stop  context.CancelFunc // stops the latency engine
@@ -31,6 +41,16 @@ var (
 	_ Outbound    = (*Failover)(nil)
 	_ UDPOutbound = (*Failover)(nil)
 )
+
+// ValidBalance reports whether mode is a balance mode Failover understands
+// ("" means no balancing).
+func ValidBalance(mode string) bool {
+	switch mode {
+	case "", "roundrobin", "random":
+		return true
+	}
+	return false
+}
 
 func (f *Failover) perTry() time.Duration {
 	if f.PerTry > 0 {
@@ -71,6 +91,7 @@ func (f *Failover) Unpin() {
 
 // order is the sequence in which outbounds are tried: the one that worked last
 // first, then the rest in list order, or in latency order when a ranking exists.
+// With Balance set it starts at the next (or a random) outbound instead.
 func (f *Failover) order() []int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -79,6 +100,19 @@ func (f *Failover) order() []int {
 	}
 	n := len(f.Outs)
 	idx := make([]int, n)
+	if n > 0 && f.Balance != "" {
+		start := 0
+		if f.Balance == "random" {
+			start = mrand.Intn(n)
+		} else {
+			start = int(f.rr % uint(n))
+			f.rr++
+		}
+		for i := range idx {
+			idx[i] = (start + i) % n
+		}
+		return idx
+	}
 	if n > 0 && len(f.rank) == n {
 		pos := 0
 		for i, r := range f.rank {
@@ -114,8 +148,10 @@ func (f *Failover) DialContext(ctx context.Context, network, target string) (net
 			prev := f.cur
 			f.cur = i
 			f.mu.Unlock()
-			if prev != i {
+			if prev != i && f.Balance == "" {
 				failLog.Warn("switched outbound", "from", prev+1, "to", i+1, "of", len(f.Outs), "why", oneLine(errors.Join(errs...)))
+			} else if len(errs) > 0 {
+				failLog.Warn("outbound skipped", "used", i+1, "of", len(f.Outs), "why", oneLine(errors.Join(errs...)))
 			}
 			return c, nil
 		}
