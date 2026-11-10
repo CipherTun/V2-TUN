@@ -70,11 +70,12 @@ type HysteriaConfig struct {
 // and, if you use one, an HTTP proxy in Proxy. With network "ws" the order is
 // proxy, payload, WebSocket, SSH. Whether TLS is used is up to the config.
 //
-// The server's HTTP reply to the payload is handled automatically and has no
-// settings: every status below 400 (101, 2xx, 3xx) lets the tunnel start, a
-// 4xx or 5xx reply fails it. For ssh, a payload with "Upgrade: websocket" also
-// detects by itself whether the stream after the reply is plain or
-// WebSocket-framed; no path, host or framing option is needed.
+// The server's HTTP reply to the payload is handled automatically: every
+// status below 400 (101, 2xx, 3xx) lets the tunnel start, a 4xx or 5xx reply
+// fails it unless that status is listed in AcceptStatus. For ssh, a payload
+// with "Upgrade: websocket" also detects by itself whether the stream after
+// the reply is plain or WebSocket-framed; no path, host or framing option is
+// needed.
 type PayloadConfig struct {
 	Template  string `json:"template"` // the payload, with tags such as [host], [crlf], [server_host_port]
 	Host      string `json:"host"`     // value for [host] and [host_port] (the bug host); empty => server host. [server], [server_port] and [server_host_port] always name the real server
@@ -95,6 +96,16 @@ type PayloadConfig struct {
 	// [server_host_port] (or [server] and [server_port]). It needs the pre-tls
 	// stage.
 	Proxy string `json:"proxy,omitempty"`
+	// AcceptStatus lists reply statuses (100 to 599) that start the tunnel
+	// although they are 400 or above, for a server that answers with an error
+	// status and then tunnels anyway. Every status below 400 is always accepted.
+	AcceptStatus []int `json:"acceptStatus,omitempty"`
+	// SkipBody (default true) reads and drops a short reply body announced by
+	// Content-Length (up to 64 KB) so it does not reach the protocol. It never
+	// applies to 101, 1xx, 204 or 304 replies or to replies to a CONNECT
+	// request. Set it to false for a server that sends a Content-Length it does
+	// not follow.
+	SkipBody *bool `json:"skipBody,omitempty"`
 }
 
 // FragmentConfig splits the TLS ClientHello: Length bytes per piece, Interval ms between.
@@ -851,10 +862,16 @@ func baseChain(cfg *Config, net_ string, to time.Duration, alpn []string, res *n
 		if err != nil {
 			return nil, err
 		}
+		for _, code := range p.AcceptStatus {
+			if code < 100 || code > 599 {
+				return nil, fmt.Errorf("v2tun: payload.acceptStatus %d is not an HTTP status (100 to 599)", code)
+			}
+		}
 		pd = &transport.Payload{Template: tpl, Host: p.Host, Method: p.Method,
 			UserAgent: p.UserAgent, SNI: psni, Vars: p.Vars,
 			ExpectResponse: payloadExpectsReply(net_, p),
 			Responses:      p.ExpectResponses, ViaProxy: p.Proxy != "", Resolver: res,
+			AcceptStatus: p.AcceptStatus, SkipBody: p.SkipBody == nil || *p.SkipBody,
 			AutoWS: strings.EqualFold(cfg.Protocol, "ssh") && (net_ == "" || net_ == "tcp")}
 	}
 	post := pd != nil && cfg.Payload.Stage == "post-tls"
