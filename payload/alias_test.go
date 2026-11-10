@@ -33,3 +33,14 @@ func TestCompatAliases(t *testing.T) {
 		t.Error("CompileCompat must reject a preset name too")
 	}
 }
+
+// [ssh] is the SSH server, never the bug host that [host] and [host_port] carry.
+func TestCompatSSHIsTheRealServer(t *testing.T) {
+	c := Context{Host: "bug.example", Port: 22, Server: "ssh.example", ServerPort: 22}
+	if got := renderCompat(t, "CONNECT [ssh] HTTP/1.1", c); got != "CONNECT ssh.example:22 HTTP/1.1" {
+		t.Errorf("[ssh] with a bug host: %q", got)
+	}
+	if got := renderCompat(t, "CONNECT [host_port] HTTP/1.1", c); got != "CONNECT bug.example:22 HTTP/1.1" {
+		t.Errorf("[host_port] with a bug host: %q", got)
+	}
+}
