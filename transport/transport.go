@@ -351,7 +351,13 @@ func (d *Payload) readReplies(c net.Conn, segs []payload.Segment) (accepted bool
 		}
 		isConnect := i < len(methods) && methods[i] == "CONNECT"
 		if d.SkipBody && !isConnect && code >= 200 && code != 204 && code != 304 {
-			if cl := contentLength(head); cl > 0 && cl <= maxSkippedBody {
+			if isChunked(head) {
+				// A chunked body has no Content-Length; without this the chunk
+				// framing would reach the SSH client instead of its banner.
+				if err := skipChunked(c, maxSkippedBody); err != nil {
+					return false, fmt.Errorf("payload: reading the chunked body of reply %d of %d: %w", i+1, n, err)
+				}
+			} else if cl := contentLength(head); cl > 0 && cl <= maxSkippedBody {
 				if _, err := io.CopyN(io.Discard, c, cl); err != nil {
 					return false, fmt.Errorf("payload: reading the body of reply %d of %d: %w", i+1, n, err)
 				}
