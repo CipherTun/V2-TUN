@@ -18,6 +18,14 @@ import (
 	"io.surprise.vpn/transport"
 )
 
+// sshHandshakeTimeout bounds the SSH banner exchange, key exchange and login on
+// a connection that is already open. ssh.ClientConfig.Timeout only covers
+// ssh.Dial, never ssh.NewClientConn, so without this a server that accepts the
+// connection and then stays silent (a wrong SNI or payload, a dead origin
+// behind a CDN) would hang the dial until the caller gives up, with nothing in
+// the log.
+const sshHandshakeTimeout = 20 * time.Second
+
 // SSH tunnels through an SSH server (direct-tcpip). The Dialer chain lets
 // you put payload/TLS(SNI)/WebSocket under SSH like HTTP Injector does.
 type SSH struct {
@@ -37,6 +45,7 @@ type SSH struct {
 	HostKeySHA256 string
 	mu            sync.Mutex
 	client        *ssh.Client
+	lastWarn      time.Time
 }
 
 // ParsePrivateKey parses a PEM or OpenSSH private key. An encrypted key needs
@@ -95,15 +104,38 @@ func (s *SSH) hostKeyCallback() ssh.HostKeyCallback {
 	}
 }
 
+// warn logs a warning, at most one every two seconds: with the server down
+// every new flow would otherwise repeat the same line. Call it with s.mu held.
+func (s *SSH) warn(msg string, args ...any) {
+	if time.Since(s.lastWarn) < 2*time.Second {
+		return
+	}
+	s.lastWarn = time.Now()
+	sshLog.Warn(msg, args...)
+}
+
+// keyboardAnswers answers every keyboard-interactive prompt with the password.
+// OpenSSH and JSch fall back to this method when a server (typically a PAM
+// setup) offers no plain "password" method, so a login that works there works
+// here too.
+func (s *SSH) keyboardAnswers(_, _ string, questions []string, _ []bool) ([]string, error) {
+	answers := make([]string, len(questions))
+	for i := range answers {
+		answers[i] = s.Password
+	}
+	return answers, nil
+}
+
 func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.client != nil {
 		return s.client, nil
 	}
-	sshLog.Debug("ssh connecting", "server", s.Server)
+	sshLog.Info("ssh connecting", "server", s.Server)
 	raw, err := s.Dialer.DialContext(ctx, "tcp", s.Server)
 	if err != nil {
+		s.warn("ssh: the connection could not be opened (tcp, tls or payload step)", "server", s.Server, "err", err)
 		return nil, err
 	}
 	cfg := &ssh.ClientConfig{
@@ -127,12 +159,31 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 		cfg.Auth = append(cfg.Auth, ssh.PublicKeys(signer))
 	}
 	if s.Password != "" {
-		cfg.Auth = append(cfg.Auth, ssh.Password(s.Password))
+		cfg.Auth = append(cfg.Auth, ssh.Password(s.Password), ssh.KeyboardInteractive(s.keyboardAnswers))
 	}
+	hctx, cancel := context.WithTimeout(ctx, sshHandshakeTimeout)
+	defer cancel()
+	stop := context.AfterFunc(hctx, func() { raw.Close() })
 	cc, chans, reqs, err := ssh.NewClientConn(raw, s.Server, cfg)
+	if !stop() { // the deadline or ctx ended first and closed the connection
+		raw.Close()
+		if err == nil {
+			cc.Close()
+		}
+		switch {
+		case ctx.Err() != nil:
+			err = fmt.Errorf("ssh: handshake with %s was cancelled: %w", s.Server, ctx.Err())
+		case err != nil:
+			err = fmt.Errorf("ssh: no SSH handshake from %s within %s (the connection opened but nothing answered; check the SNI, payload and port): %w", s.Server, sshHandshakeTimeout, err)
+		default:
+			err = fmt.Errorf("ssh: no SSH handshake from %s within %s (the connection opened but nothing answered; check the SNI, payload and port)", s.Server, sshHandshakeTimeout)
+		}
+		s.warn("ssh handshake did not finish", "server", s.Server, "err", err)
+		return nil, err
+	}
 	if err != nil {
 		raw.Close()
-		sshLog.Warn("ssh handshake or login failed", "server", s.Server, "user", s.User, "err", err)
+		s.warn("ssh handshake or login failed", "server", s.Server, "user", s.User, "err", err)
 		return nil, err
 	}
 	cl := ssh.NewClient(cc, chans, reqs)
