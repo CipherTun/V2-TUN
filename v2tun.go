@@ -244,9 +244,13 @@ type Config struct {
 	Advanced     Advanced          `json:"advanced"`
 	Routing      *route.Config     `json:"routing,omitempty"`
 	Mux          *MuxConfig        `json:"mux,omitempty"`
-	UDPGW        string            `json:"udpgw"`     // BadVPN udpgw address as seen from the server, e.g. "127.0.0.1:7300"
-	DirectDNS    string            `json:"directDns"` // resolver for hostnames, bypasses the VPN (default 1.1.1.1:53)
-	TimeoutSec   int               `json:"timeoutSec"`
+	UDPGW        string            `json:"udpgw"` // BadVPN udpgw address as seen from the server, e.g. "127.0.0.1:7300"
+	// DirectDNS is the resolver for hostnames; it bypasses the VPN (default
+	// 1.1.1.1:53). It can list several, separated by commas or spaces, which are
+	// tried in order, and "tls://host[:port]" entries use DNS over TLS, for
+	// example "1.1.1.1:53,tls://dns.google,8.8.4.4".
+	DirectDNS  string `json:"directDns"`
+	TimeoutSec int    `json:"timeoutSec"`
 
 	// IdleTimeoutSec closes a tunneled connection after this many seconds with
 	// no data in either direction (0 = never). Top-level config only.
@@ -266,6 +270,12 @@ type Config struct {
 	// first (the one in use stays first until it fails). 0 keeps the listed
 	// order. Top-level config only.
 	LatencySortSec int `json:"latencySortSec,omitempty"`
+	// Balance, with Backups, shares the connections between the main config and
+	// its backups instead of using the one that worked last: "roundrobin" starts
+	// each connection at the next one, "random" at a random one. A server that
+	// fails still hands the connection on to the next. It cannot be combined
+	// with latencySortSec. Top-level config only.
+	Balance string `json:"balance,omitempty"`
 }
 
 type MuxConfig struct {
@@ -388,6 +398,15 @@ func New(cfg *Config) (*Client, error) {
 	if dns == "" {
 		dns = "1.1.1.1:53"
 	}
+	if !proxy.ValidBalance(cfg.Balance) {
+		return nil, fmt.Errorf("v2tun: balance %q is not roundrobin or random", cfg.Balance)
+	}
+	if cfg.Balance != "" && len(cfg.Backups) == 0 {
+		return nil, errors.New("v2tun: balance needs backups to share the connections with")
+	}
+	if cfg.Balance != "" && cfg.LatencySortSec > 0 {
+		return nil, errors.New("v2tun: balance and latencySortSec cannot be combined")
+	}
 	res := transport.NewResolver(dns)
 	out, to, err := buildOutbound(cfg, res)
 	if err != nil {
@@ -400,8 +419,8 @@ func New(cfg *Config) (*Client, error) {
 			if len(b.Backups) > 0 {
 				return nil, fmt.Errorf("v2tun: backup %d has backups of its own; list every backup in the top-level backups", i+1)
 			}
-			if b.Routing != nil || b.UDPGW != "" || b.DirectDNS != "" {
-				return nil, fmt.Errorf("v2tun: backup %d sets routing, udpgw or directDns; those belong to the top-level config", i+1)
+			if b.Routing != nil || b.UDPGW != "" || b.DirectDNS != "" || b.Balance != "" {
+				return nil, fmt.Errorf("v2tun: backup %d sets routing, udpgw, directDns or balance; those belong to the top-level config", i+1)
 			}
 			bo, _, err := buildOutbound(b, res)
 			if err != nil {
@@ -409,7 +428,7 @@ func New(cfg *Config) (*Client, error) {
 			}
 			outs = append(outs, bo)
 		}
-		out = &proxy.Failover{Outs: outs, PerTry: time.Duration(cfg.FailoverTimeoutSec) * time.Second}
+		out = &proxy.Failover{Outs: outs, PerTry: time.Duration(cfg.FailoverTimeoutSec) * time.Second, Balance: cfg.Balance}
 	}
 	c := &Client{out: out, direct: &transport.TCP{Timeout: to, Resolver: res}, resolver: res,
 		idle: time.Duration(cfg.IdleTimeoutSec) * time.Second}
