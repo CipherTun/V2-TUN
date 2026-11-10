@@ -18,13 +18,28 @@ import (
 	"io.surprise.vpn/transport"
 )
 
-// sshHandshakeTimeout bounds the SSH banner exchange, key exchange and login on
-// a connection that is already open. ssh.ClientConfig.Timeout only covers
-// ssh.Dial, never ssh.NewClientConn, so without this a server that accepts the
-// connection and then stays silent (a wrong SNI or payload, a dead origin
-// behind a CDN) would hang the dial until the caller gives up, with nothing in
-// the log.
-const sshHandshakeTimeout = 20 * time.Second
+const (
+	// sshHandshakeTimeout bounds the SSH banner exchange, key exchange and
+	// login on a connection that is already open. ssh.ClientConfig.Timeout
+	// only covers ssh.Dial, never ssh.NewClientConn, so without this a server
+	// that accepts the connection and then stays silent (a wrong SNI or
+	// payload, a dead origin behind a CDN) would hang the dial until the
+	// caller gives up, with nothing in the log.
+	sshHandshakeTimeout = 20 * time.Second
+
+	// Keepalive, like OpenSSH's ServerAliveInterval and ServerAliveCountMax:
+	// a probe every sshKeepaliveEvery, a miss when it is not answered within
+	// sshKeepaliveTimeout, and the session is dropped after sshKeepaliveMisses
+	// misses in a row so the next dial reconnects.
+	sshKeepaliveEvery   = 15 * time.Second
+	sshKeepaliveTimeout = 10 * time.Second
+	sshKeepaliveMisses  = 3
+
+	// sshAuthCooldown is how long new logins are refused after the server
+	// rejected the credentials. Every new flow would otherwise try again and a
+	// server with fail2ban or MaxAuthTries locks the account.
+	sshAuthCooldown = 30 * time.Second
+)
 
 // SSH tunnels through an SSH server (direct-tcpip). The Dialer chain lets
 // you put payload/TLS(SNI)/WebSocket under SSH like HTTP Injector does.
@@ -46,6 +61,7 @@ type SSH struct {
 	mu            sync.Mutex
 	client        *ssh.Client
 	lastWarn      time.Time
+	authFailUntil time.Time
 }
 
 // ParsePrivateKey parses a PEM or OpenSSH private key. An encrypted key needs
@@ -126,11 +142,28 @@ func (s *SSH) keyboardAnswers(_, _ string, questions []string, _ []bool) ([]stri
 	return answers, nil
 }
 
+// showBanner logs the text a server sends before the login. Providers use it
+// for things like "account expired" or "connection limit reached".
+func (s *SSH) showBanner(msg string) error {
+	text := strings.Join(strings.Fields(msg), " ")
+	if text == "" {
+		return nil
+	}
+	if len(text) > 300 {
+		text = text[:300] + "..."
+	}
+	sshLog.Info("ssh server banner", "server", s.Server, "text", text)
+	return nil
+}
+
 func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.client != nil {
 		return s.client, nil
+	}
+	if wait := time.Until(s.authFailUntil); wait > 0 {
+		return nil, fmt.Errorf("ssh: the server refused the login for %q a moment ago; not trying again for %s to avoid a lockout (check the username and password)", s.User, wait.Round(time.Second))
 	}
 	sshLog.Info("ssh connecting", "server", s.Server)
 	raw, err := s.Dialer.DialContext(ctx, "tcp", s.Server)
@@ -141,6 +174,7 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 	cfg := &ssh.ClientConfig{
 		User:            s.User,
 		HostKeyCallback: s.hostKeyCallback(),
+		BannerCallback:  s.showBanner,
 		Timeout:         20 * time.Second,
 		Config: ssh.Config{
 			Ciphers:      pick(s.Options.Ciphers, sshCiphers),
@@ -183,20 +217,18 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 	}
 	if err != nil {
 		raw.Close()
-		s.warn("ssh handshake or login failed", "server", s.Server, "user", s.User, "err", err)
+		if strings.Contains(err.Error(), "unable to authenticate") {
+			s.authFailUntil = time.Now().Add(sshAuthCooldown)
+			s.warn("ssh login refused, pausing new logins", "server", s.Server, "user", s.User, "pause", sshAuthCooldown.String(), "err", err)
+		} else {
+			s.warn("ssh handshake or login failed", "server", s.Server, "user", s.User, "err", err)
+		}
 		return nil, err
 	}
 	cl := ssh.NewClient(cc, chans, reqs)
 	s.client = cl
 	sshLog.Info("ssh session established", "server", s.Server, "user", s.User, "remote", string(cc.ServerVersion()))
-	go func() { // keepalive so NAT/carriers don't drop the tunnel
-		for {
-			time.Sleep(25 * time.Second)
-			if _, _, err := cl.SendRequest("keepalive@openssh.com", true, nil); err != nil {
-				return
-			}
-		}
-	}()
+	go s.keepalive(cl)
 	go func() {
 		err := cl.Wait()
 		s.mu.Lock()
@@ -210,6 +242,50 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 		s.drop(cl)
 	}()
 	return cl, nil
+}
+
+// current reports whether cl is still the live session.
+func (s *SSH) current(cl *ssh.Client) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.client == cl
+}
+
+// keepalive probes the session so NAT and carriers do not drop it, and so a
+// session that went silent is noticed. A probe that gets no answer within
+// sshKeepaliveTimeout counts as a miss; sshKeepaliveMisses misses in a row drop
+// the session, and the next dial reconnects. Without the timeout a silent
+// network leaves the request waiting for as long as TCP takes to give up.
+func (s *SSH) keepalive(cl *ssh.Client) {
+	t := time.NewTicker(sshKeepaliveEvery)
+	defer t.Stop()
+	misses := 0
+	for range t.C {
+		if !s.current(cl) {
+			return
+		}
+		res := make(chan error, 1)
+		go func() {
+			_, _, err := cl.SendRequest("keepalive@openssh.com", true, nil)
+			res <- err
+		}()
+		select {
+		case err := <-res:
+			if err != nil {
+				return // the session ended; the Wait goroutine reports it
+			}
+			misses = 0
+		case <-time.After(sshKeepaliveTimeout):
+			misses++
+			if misses < sshKeepaliveMisses {
+				sshLog.Debug("ssh keepalive not answered", "server", s.Server, "misses", misses)
+				continue
+			}
+			sshLog.Warn("ssh session dropped: the server stopped answering keepalives", "server", s.Server, "misses", misses)
+			s.drop(cl)
+			return
+		}
+	}
 }
 
 // drop forgets cl (if it is still the current session) and closes it.
@@ -298,9 +374,14 @@ type SSHOptions struct {
 var (
 	sshCiphers = []string{"aes128-gcm@openssh.com", "aes256-gcm@openssh.com", "chacha20-poly1305@openssh.com",
 		"aes128-ctr", "aes192-ctr", "aes256-ctr", "aes128-cbc", "3des-cbc", "arcfour256", "arcfour128"}
+	// The last three are only used when the server offers nothing from the
+	// earlier ones, so they cannot change the outcome for servers that already
+	// connect. Group exchange is what some old OpenSSH and Dropbear builds
+	// prefer.
 	sshKEX = []string{"curve25519-sha256", "curve25519-sha256@libssh.org", "ecdh-sha2-nistp256",
 		"ecdh-sha2-nistp384", "ecdh-sha2-nistp521", "diffie-hellman-group14-sha256",
-		"diffie-hellman-group14-sha1", "diffie-hellman-group1-sha1"}
+		"diffie-hellman-group14-sha1", "diffie-hellman-group1-sha1",
+		"diffie-hellman-group16-sha512", "diffie-hellman-group-exchange-sha256", "diffie-hellman-group-exchange-sha1"}
 	sshMACs = []string{"hmac-sha2-256-etm@openssh.com", "hmac-sha2-512-etm@openssh.com",
 		"hmac-sha2-256", "hmac-sha2-512", "hmac-sha1", "hmac-sha1-96"}
 	sshHostKeys = []string{"ssh-ed25519", "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384",
