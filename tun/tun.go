@@ -49,6 +49,25 @@ type UDPDialer interface {
 	DialUDP(ctx context.Context, addr string) (net.Conn, error)
 }
 
+// UDPChecker is optional on a UDPDialer: CanDialUDP says, without dialing,
+// whether a flow to addr can be carried at all (a tunnel without UDP support
+// and without udpgw cannot). A flow it refuses is answered with ICMP port
+// unreachable at once.
+type UDPChecker interface {
+	CanDialUDP(addr string) bool
+}
+
+// canRelayUDP reports whether a UDP flow to dst has anything to carry it.
+func canRelayUDP(dst string, o Options) bool {
+	if o.UDP == nil {
+		return false
+	}
+	if ck, ok := o.UDP.(UDPChecker); ok {
+		return ck.CanDialUDP(resolveDst(dst, o))
+	}
+	return true
+}
+
 type Options struct {
 	// FD is the TUN descriptor (ParcelFileDescriptor.getFd()). The caller keeps
 	// ownership and must close it after Tun.Close returns; the stack never does.
@@ -113,9 +132,19 @@ func Start(o Options) (*Tun, error) {
 
 	// udp.ForwarderHandler is func(*ForwarderRequest) (handled bool): true means
 	// this handler took the packet; false lets the stack answer with ICMP port
-	// unreachable. Flows we cannot serve are dropped silently (true), not refused.
+	// unreachable. A flow that nothing can carry is refused that way, not
+	// dropped: an app that gets the error falls back at once (Chrome gives up
+	// QUIC and uses TCP), while a silent drop leaves it waiting for a timeout.
 	uf := udp.NewForwarder(s, func(r *udp.ForwarderRequest) bool {
 		id := r.ID()
+		dnsFlow := id.LocalPort == 53 && (o.DNS != "" || o.UDP == nil || o.Fake != nil)
+		dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
+		if !dnsFlow && !canRelayUDP(dst, o) {
+			// No native UDP and no udpgw: nothing can carry this flow. No endpoint
+			// is created, so the stack sends the ICMP port unreachable itself.
+			tunLog.Debug("udp flow refused: no udp relay", "dst", dst)
+			return false
+		}
 		var wq waiter.Queue
 		e, err := r.CreateEndpoint(&wq)
 		if err != nil {
@@ -124,19 +153,14 @@ func Start(o Options) (*Tun, error) {
 			return false
 		}
 		c := gonet.NewUDPConn(&wq, e)
-		dst := net.JoinHostPort(id.LocalAddress.String(), strconv.Itoa(int(id.LocalPort)))
-		switch {
-		case id.LocalPort == 53 && (o.DNS != "" || o.UDP == nil || o.Fake != nil):
+		if dnsFlow {
 			dns := o.DNS
 			if dns == "" {
 				dns = dst
 			}
 			go serveDNS(ctx, c, dns, o)
-		case o.UDP != nil:
+		} else {
 			go relayUDP(ctx, c, dst, o)
-		default:
-			tunLog.Debug("udp flow dropped: no udp relay", "dst", dst)
-			c.Close() // no UDP support: drop
 		}
 		return true
 	})
