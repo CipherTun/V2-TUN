@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"net"
+	"net/url"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,13 +22,17 @@ const dnsRetryPrimary = 30 * time.Second
 // spaces. The first is used until it fails to answer, then the next one, and
 // the first is tried again after 30 seconds. An entry is "host:port" for plain
 // DNS (port 53 when left out) or "tls://host[:port]" for DNS over TLS (port
-// 853 by default), for example "1.1.1.1:53,tls://dns.google,8.8.4.4".
+// 853 by default), or "https://host[:port][/path]" for DNS over HTTPS (path
+// /dns-query by default; an IP literal or dns.google, cloudflare-dns.com or
+// dns.quad9.net need no lookup of their own). DNS over HTTPS uses port 443, so it
+// still works where plain DNS and DNS over TLS are blocked or redirected. For
+// example "1.1.1.1:53,https://8.8.8.8/dns-query,tls://dns.google,8.8.4.4".
 func NewResolver(server string) *net.Resolver {
 	list := parseDNSServers(server)
 	if len(list) == 0 {
 		return nil
 	}
-	if len(list) == 1 && !list[0].tls {
+	if len(list) == 1 && !list[0].tls && list[0].doh == nil {
 		addr := list[0].addr
 		return &net.Resolver{PreferGo: true, Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			d := net.Dialer{Timeout: 5 * time.Second, Control: controlFn}
@@ -42,12 +47,24 @@ type dnsServer struct {
 	addr string // host:port
 	name string // TLS server name (DNS over TLS only)
 	tls  bool
+	doh  *dohEndpoint // DNS over HTTPS server; addr is only its host, for logs
 }
 
 // parseDNSServers reads the server list; entries it cannot use are skipped.
 func parseDNSServers(s string) []dnsServer {
 	var out []dnsServer
 	for _, f := range strings.FieldsFunc(s, func(r rune) bool { return r == ',' || r == ' ' || r == '\t' || r == '\n' }) {
+		if len(f) >= 8 && strings.EqualFold(f[:8], "https://") {
+			u, err := url.Parse(f)
+			if err != nil || u.Hostname() == "" {
+				continue
+			}
+			if u.Path == "" {
+				u.Path = "/dns-query"
+			}
+			out = append(out, dnsServer{addr: u.Host, doh: newDoHEndpoint(u)})
+			continue
+		}
 		useTLS := false
 		if rest, ok := strings.CutPrefix(f, "tls://"); ok {
 			f, useTLS = rest, true
@@ -104,6 +121,11 @@ func (p *dnsPool) fail(idx int) {
 func (p *dnsPool) dial(ctx context.Context, network, _ string) (net.Conn, error) {
 	idx := p.pick()
 	s := p.servers[idx]
+	if s.doh != nil {
+		// Nothing is dialed here: the HTTPS request is made when the query is
+		// written, and a failure shows up on the read.
+		return newDoHConn(s.doh, p, idx), nil
+	}
 	d := net.Dialer{Timeout: 5 * time.Second, Control: controlFn}
 	var c net.Conn
 	var err error
