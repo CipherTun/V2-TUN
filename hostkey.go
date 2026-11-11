@@ -23,7 +23,7 @@ func ProbeHostKey(ctx context.Context, cfg *Config) (string, error) {
 	probe.Advanced.SSHHostKey = ""
 	dns := probe.DirectDNS
 	if dns == "" {
-		dns = "1.1.1.1:53"
+		dns = defaultDirectDNS
 	}
 	out, _, err := buildOutbound(&probe, transport.NewResolver(dns))
 	if err != nil {
