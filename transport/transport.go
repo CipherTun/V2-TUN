@@ -2,6 +2,7 @@
 package transport
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"crypto/tls"
@@ -332,39 +333,61 @@ func countRequests(segs []payload.Segment) int {
 // readReplies reads the replies to the payload's requests. A 101 ends it, since
 // nothing HTTP can follow an upgrade. accepted reports whether that 101 carried
 // a Sec-WebSocket-Accept header, which a real WebSocket handshake always has.
-func (d *Payload) readReplies(c net.Conn, segs []payload.Segment) (accepted bool, err error) {
+//
+// It also ends when the stream turns into the SSH banner ("SSH-") before all
+// the replies came: a front that answers only some of the payload's request
+// lines (or a decoy line it ignores) would otherwise leave this waiting for a
+// reply that never comes, or read the banner as one. HTTP Custom stops at the
+// banner the same way.
+//
+// Reading goes through a buffer so the banner can be looked at without being
+// taken. The returned conn is the one to carry on with: when bytes were read
+// ahead they are replayed before the rest of the stream.
+func (d *Payload) readReplies(c net.Conn, segs []payload.Segment) (out net.Conn, accepted bool, err error) {
 	n := d.Responses
 	if n <= 0 {
 		n = countRequests(segs)
 	}
 	methods := requestMethods(segs)
+	br := bufio.NewReader(c)
+	defer func() {
+		out = c
+		if br.Buffered() > 0 {
+			out = &bufConn{Conn: c, br: br}
+		}
+	}()
 	for i := 0; i < n; i++ {
-		code, head, err := payload.ReadHTTPReply(c)
+		if head, perr := br.Peek(4); perr != nil {
+			return c, false, fmt.Errorf("payload: waiting for reply %d of %d: %w", i+1, n, perr)
+		} else if string(head) == "SSH-" {
+			return c, false, nil // the SSH banner: no more replies are coming
+		}
+		code, head, err := payload.ReadHTTPReply(br)
 		if err != nil {
-			return false, fmt.Errorf("payload: waiting for reply %d of %d: %w", i+1, n, err)
+			return c, false, fmt.Errorf("payload: waiting for reply %d of %d: %w", i+1, n, err)
 		}
 		if !d.accepts(code) {
-			return false, fmt.Errorf("payload: reply %d of %d has status %d", i+1, n, code)
+			return c, false, fmt.Errorf("payload: reply %d of %d has status %d", i+1, n, code)
 		}
 		if code == 101 {
-			return strings.Contains(strings.ToLower(head), "\nsec-websocket-accept:"), nil
+			return c, strings.Contains(strings.ToLower(head), "\nsec-websocket-accept:"), nil
 		}
 		isConnect := i < len(methods) && methods[i] == "CONNECT"
 		if d.SkipBody && !isConnect && code >= 200 && code != 204 && code != 304 {
 			if isChunked(head) {
 				// A chunked body has no Content-Length; without this the chunk
 				// framing would reach the SSH client instead of its banner.
-				if err := skipChunked(c, maxSkippedBody); err != nil {
-					return false, fmt.Errorf("payload: reading the chunked body of reply %d of %d: %w", i+1, n, err)
+				if err := skipChunked(br, maxSkippedBody); err != nil {
+					return c, false, fmt.Errorf("payload: reading the chunked body of reply %d of %d: %w", i+1, n, err)
 				}
 			} else if cl := contentLength(head); cl > 0 && cl <= maxSkippedBody {
-				if _, err := io.CopyN(io.Discard, c, cl); err != nil {
-					return false, fmt.Errorf("payload: reading the body of reply %d of %d: %w", i+1, n, err)
+				if _, err := io.CopyN(io.Discard, br, cl); err != nil {
+					return c, false, fmt.Errorf("payload: reading the body of reply %d of %d: %w", i+1, n, err)
 				}
 			}
 		}
 	}
-	return false, nil
+	return c, false, nil
 }
 
 // serverIP is the address [ip] stands for: the peer of the connection, or,
@@ -425,7 +448,7 @@ func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Co
 		// after 30 seconds, whichever comes first.
 		stop := context.AfterFunc(ctx, func() { c.Close() })
 		limit := time.AfterFunc(30*time.Second, func() { c.Close() })
-		accepted, err := d.readReplies(c, segs)
+		rc, accepted, err := d.readReplies(c, segs)
 		limit.Stop()
 		if !stop() && err == nil {
 			err = ctx.Err()
@@ -435,8 +458,9 @@ func (d *Payload) DialContext(ctx context.Context, network, addr string) (net.Co
 			return nil, err
 		}
 		if d.AutoWS && wantsWebSocket(segs) {
-			return autoWebSocket(c, accepted), nil
+			return autoWebSocket(rc, accepted), nil
 		}
+		return rc, nil
 	}
 	return c, nil
 }
