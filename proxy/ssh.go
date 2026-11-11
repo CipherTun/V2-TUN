@@ -39,7 +39,44 @@ const (
 	// rejected the credentials. Every new flow would otherwise try again and a
 	// server with fail2ban or MaxAuthTries locks the account.
 	sshAuthCooldown = 30 * time.Second
+
+	// sshClientVersion is the identification string sent when the user sets
+	// none. Go's own default ("SSH-2.0-Go") is easy to spot and some servers and
+	// middleboxes treat it differently from OpenSSH; MegaProxy and the Android
+	// injector apps also look like OpenSSH or JSch.
+	sshClientVersion = "SSH-2.0-OpenSSH_8.4"
+
+	// sshChannelOpenTimeout is how long one channel open may wait for the
+	// server's answer. The server answers only after it reached the target, so
+	// a slow target is not a sick session: a stalled open makes the client
+	// probe the session (see channelStalled) instead of dropping it blindly.
+	sshChannelOpenTimeout = 15 * time.Second
+
+	// sshMaxOpening limits channel opens that wait for an answer at the same
+	// time. A page with many dead hosts would otherwise flood the server with
+	// opens, and a server at its limit refuses all of them.
+	sshMaxOpening = 32
+
+	// sshShortageRetries is how many times an open is repeated after the server
+	// answered "resource shortage" (it is at its channel limit), with a short
+	// pause that grows each time.
+	sshShortageRetries = 2
 )
+
+// ValidClientVersion reports whether v can be sent as the SSH identification
+// string: "SSH-2.0-" followed by printable ASCII (a space starts the optional
+// comment), 255 bytes at most with the line ending (RFC 4253 section 4.2).
+func ValidClientVersion(v string) bool {
+	if !strings.HasPrefix(v, "SSH-2.0-") || len(v) == len("SSH-2.0-") || len(v) > 253 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		if v[i] < 0x20 || v[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
 
 // SSH tunnels through an SSH server (direct-tcpip). The Dialer chain lets
 // you put payload/TLS(SNI)/WebSocket under SSH like HTTP Injector does.
@@ -62,6 +99,10 @@ type SSH struct {
 	client        *ssh.Client
 	lastWarn      time.Time
 	authFailUntil time.Time
+	probing       bool // a session probe after a stalled channel open is running
+
+	slotsOnce sync.Once
+	slotsCh   chan struct{} // limits the channel opens that wait for an answer
 }
 
 // ParsePrivateKey parses a PEM or OpenSSH private key. An encrypted key needs
@@ -182,6 +223,7 @@ func (s *SSH) connect(ctx context.Context) (*ssh.Client, error) {
 			MACs:         pick(s.Options.MACs, sshMACs),
 		},
 		HostKeyAlgorithms: pick(s.Options.HostKeyAlgos, sshHostKeys),
+		ClientVersion:     s.clientVersion(),
 	}
 	if len(s.PrivateKey) > 0 {
 		signer, err := ParsePrivateKey(s.PrivateKey, s.Passphrase)
@@ -311,9 +353,79 @@ func (s *SSH) Close() error {
 	return nil
 }
 
-// dialChannel opens a direct-tcpip channel but gives up when ctx ends
-// (ssh.Client.Dial itself has no timeout).
-func dialChannel(ctx context.Context, cl *ssh.Client, target string) (net.Conn, error) {
+// clientVersion is the identification string this client sends.
+func (s *SSH) clientVersion() string {
+	if v := s.Options.ClientVersion; v != "" {
+		return v
+	}
+	return sshClientVersion
+}
+
+// slots returns the semaphore that limits channel opens waiting for an answer.
+func (s *SSH) slots() chan struct{} {
+	s.slotsOnce.Do(func() { s.slotsCh = make(chan struct{}, sshMaxOpening) })
+	return s.slotsCh
+}
+
+// errChannelStalled means the server did not answer a channel open in time.
+var errChannelStalled = errors.New("ssh: the server did not answer the channel open in time (the target may be unreachable from the server)")
+
+// sessionAlive sends a keepalive and reports whether the server answered
+// within timeout. Any answer counts, even a refusal: it proves the session is
+// up.
+func sessionAlive(cl *ssh.Client, timeout time.Duration) bool {
+	res := make(chan error, 1)
+	go func() {
+		_, _, err := cl.SendRequest("keepalive@openssh.com", true, nil)
+		res <- err
+	}()
+	select {
+	case err := <-res:
+		return err == nil
+	case <-time.After(timeout):
+		return false
+	}
+}
+
+// channelStalled is called when a channel open got no answer in time. A slow
+// or dead target causes that as well, so the session is probed with a
+// keepalive and dropped only when the server does not answer that either;
+// the next dial then reconnects at once instead of after three missed
+// keepalives. One probe runs at a time.
+func (s *SSH) channelStalled(cl *ssh.Client) {
+	s.mu.Lock()
+	if s.client != cl || s.probing {
+		s.mu.Unlock()
+		return
+	}
+	s.probing = true
+	s.mu.Unlock()
+	go func() {
+		alive := sessionAlive(cl, sshKeepaliveTimeout)
+		s.mu.Lock()
+		s.probing = false
+		if !alive && s.client == cl {
+			s.warn("ssh session dropped: a channel open and the probe after it got no answer", "server", s.Server)
+		}
+		s.mu.Unlock()
+		if !alive {
+			s.drop(cl)
+		}
+	}()
+}
+
+// openChannel opens a direct-tcpip channel (ssh.Client.Dial has no timeout of
+// its own). It gives up when ctx ends or after sshChannelOpenTimeout, and at
+// most sshMaxOpening opens wait for an answer at the same time.
+func (s *SSH) openChannel(ctx context.Context, cl *ssh.Client, target string) (net.Conn, error) {
+	slots := s.slots()
+	select {
+	case slots <- struct{}{}:
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+	defer func() { <-slots }()
+
 	type result struct {
 		conn net.Conn
 		err  error
@@ -323,39 +435,66 @@ func dialChannel(ctx context.Context, cl *ssh.Client, target string) (net.Conn, 
 		conn, err := cl.Dial("tcp", target)
 		ch <- result{conn, err}
 	}()
-	select {
-	case r := <-ch:
-		return r.conn, r.err
-	case <-ctx.Done():
+	// An abandoned open may still succeed later; close what it returns.
+	abandon := func() {
 		go func() {
 			if r := <-ch; r.conn != nil {
 				r.conn.Close()
 			}
 		}()
+	}
+	timer := time.NewTimer(sshChannelOpenTimeout)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.conn, r.err
+	case <-ctx.Done():
+		abandon()
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			s.channelStalled(cl)
+		}
 		return nil, ctx.Err()
+	case <-timer.C:
+		abandon()
+		s.channelStalled(cl)
+		return nil, errChannelStalled
 	}
 }
 
 func (s *SSH) DialContext(ctx context.Context, network, target string) (net.Conn, error) {
-	for attempt := 0; ; attempt++ {
+	reconnected := false
+	shortages := 0
+	for {
 		cl, err := s.connect(ctx)
 		if err != nil {
 			return nil, err
 		}
-		conn, err := dialChannel(ctx, cl, target)
+		conn, err := s.openChannel(ctx, cl, target)
 		if err == nil {
 			return conn, nil
 		}
 		// The target refusing the connection says nothing about the session.
 		var refused *ssh.OpenChannelError
 		if errors.As(err, &refused) {
+			// The server is at its channel limit: ask again after a short pause.
+			if refused.Reason == ssh.ResourceShortage && shortages < sshShortageRetries && ctx.Err() == nil {
+				shortages++
+				sshLog.Debug("ssh server is out of channels, retrying", "target", target, "attempt", shortages)
+				select {
+				case <-time.After(time.Duration(shortages) * 300 * time.Millisecond):
+					continue
+				case <-ctx.Done():
+					return nil, ctx.Err()
+				}
+			}
 			sshLog.Debug("ssh server refused the target", "target", target, "err", err)
 			return nil, err
 		}
-		if attempt > 0 || ctx.Err() != nil {
+		if errors.Is(err, errChannelStalled) || reconnected || ctx.Err() != nil {
 			return nil, err
 		}
 		// The session may have died since its last use: reconnect once.
+		reconnected = true
 		sshLog.Info("ssh session looks dead, reconnecting", "server", s.Server, "err", err)
 		s.drop(cl)
 	}
@@ -369,6 +508,9 @@ type SSHOptions struct {
 	KeyExchanges []string
 	MACs         []string
 	HostKeyAlgos []string
+	// ClientVersion is the SSH identification string ("SSH-2.0-..."); empty
+	// sends sshClientVersion.
+	ClientVersion string
 }
 
 var (
