@@ -189,6 +189,10 @@ type Advanced struct {
 	// SSHHostKey pins the SSH server's host key: "SHA256:..." as printed by
 	// ssh-keygen -l, or 64 hex characters. Empty accepts any key.
 	SSHHostKey string `json:"sshHostKey,omitempty"`
+	// SSHClientVersion is the SSH identification string sent to the server
+	// ("SSH-2.0-..."). Empty sends "SSH-2.0-OpenSSH_8.4" instead of Go's
+	// recognisable "SSH-2.0-Go".
+	SSHClientVersion string `json:"sshClientVersion,omitempty"`
 	// SSHNext turns the ssh protocol into a double hop. The top-level server,
 	// username, password, privateKey and sshHostKey then describe the first
 	// (jump) host, which is reached through the whole dial chain (payload, TLS,
@@ -245,10 +249,13 @@ type Config struct {
 	Routing      *route.Config     `json:"routing,omitempty"`
 	Mux          *MuxConfig        `json:"mux,omitempty"`
 	UDPGW        string            `json:"udpgw"` // BadVPN udpgw address as seen from the server, e.g. "127.0.0.1:7300"
-	// DirectDNS is the resolver for hostnames; it bypasses the VPN (default
-	// 1.1.1.1:53). It can list several, separated by commas or spaces, which are
-	// tried in order, and "tls://host[:port]" entries use DNS over TLS, for
-	// example "1.1.1.1:53,tls://dns.google,8.8.4.4".
+	// DirectDNS is the resolver for hostnames; it bypasses the VPN. The default
+	// is 1.1.1.1:53 with DNS over HTTPS and further resolvers behind it (see
+	// defaultDirectDNS), so a network that blocks plain DNS still resolves. It
+	// can list several, separated by commas or spaces, which are tried in order;
+	// "tls://host[:port]" entries use DNS over TLS and "https://host[/path]"
+	// entries DNS over HTTPS (port 443), for example
+	// "1.1.1.1:53,https://8.8.8.8/dns-query,tls://dns.google,8.8.4.4".
 	DirectDNS  string `json:"directDns"`
 	TimeoutSec int    `json:"timeoutSec"`
 
@@ -391,12 +398,20 @@ func checkTLSVerify(cfg *Config) error {
 	return nil
 }
 
+// defaultDirectDNS is the resolver list used when directDns is empty. Plain DNS
+// to 1.1.1.1 comes first (fastest where it works); when it does not answer, the
+// resolver moves on to DNS over HTTPS (port 443), which gets through where
+// port 53 is blocked or redirected (the usual cause of a hostname that times
+// out, such as a cloudfront.net front), on another provider first in case
+// 1.1.1.1 itself is blocked. All of them use protected sockets.
+const defaultDirectDNS = "1.1.1.1:53,https://8.8.8.8/dns-query,https://1.1.1.1/dns-query,8.8.8.8:53,https://9.9.9.9/dns-query"
+
 // New builds the tunnel client: the outbound described by cfg, then cfg.Backups
 // behind a proxy.Failover when there are any, plus routing and udpgw.
 func New(cfg *Config) (*Client, error) {
 	dns := cfg.DirectDNS
 	if dns == "" {
-		dns = "1.1.1.1:53"
+		dns = defaultDirectDNS
 	}
 	if !proxy.ValidBalance(cfg.Balance) {
 		return nil, fmt.Errorf("v2tun: balance %q is not roundrobin or random", cfg.Balance)
@@ -563,8 +578,11 @@ func buildOutbound(cfg *Config, res *net.Resolver) (proxy.Outbound, time.Duratio
 		if pin := cfg.Advanced.SSHHostKey; pin != "" && !proxy.ValidHostKeyPin(pin) {
 			return nil, 0, errors.New(`v2tun: advanced.sshHostKey must be "SHA256:..." (as ssh-keygen -l prints it) or 64 hex characters`)
 		}
+		if v := cfg.Advanced.SSHClientVersion; v != "" && !proxy.ValidClientVersion(v) {
+			return nil, 0, errors.New(`v2tun: advanced.sshClientVersion must start with "SSH-2.0-" and hold printable ASCII only (for example "SSH-2.0-OpenSSH_8.4")`)
+		}
 		opts := proxy.SSHOptions{Ciphers: cfg.Advanced.SSHCiphers, KeyExchanges: cfg.Advanced.SSHKeyExchanges,
-			MACs: cfg.Advanced.SSHMACs, HostKeyAlgos: cfg.Advanced.SSHHostKeys}
+			MACs: cfg.Advanced.SSHMACs, HostKeyAlgos: cfg.Advanced.SSHHostKeys, ClientVersion: cfg.Advanced.SSHClientVersion}
 		first := &proxy.SSH{Server: srv, Dialer: d, User: cfg.Username,
 			Password: cfg.Password, PrivateKey: readKey(cfg.PrivateKey), Passphrase: cfg.Passphrase,
 			HostKeySHA256: cfg.Advanced.SSHHostKey, Options: opts}
@@ -736,6 +754,26 @@ func (c *Client) DialUDP(ctx context.Context, addr string) (net.Conn, error) {
 		return nil, err
 	}
 	return c.conns.track(countConn{conn}, "udp", addr, via), nil
+}
+
+// CanDialUDP reports, without dialing, whether DialUDP could carry a flow to
+// addr: the protocol has native UDP, udpgw is set, or a routing rule sends the
+// flow direct. The TUN layer asks before it accepts a UDP flow, so a flow
+// nothing can carry gets an ICMP port unreachable (the app falls back to TCP at
+// once) instead of a silent drop.
+func (c *Client) CanDialUDP(addr string) bool {
+	if proxy.SupportsUDP(c.out) || c.gw != nil {
+		return true
+	}
+	if c.router == nil {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil || net.ParseIP(host) == nil {
+		return true // a domain: deciding could need DNS, so DialUDP decides
+	}
+	act, err := c.decide(context.Background(), "udp", addr)
+	return err != nil || act == route.Direct
 }
 
 // resolveAddr turns host:port into ip:port using the protected resolver.
